@@ -1,6 +1,3 @@
-        cum[i] = (uint16_t)c;
-        c += freq[i];
-    }
 }
 
 static size_t rans_estimate_payload(const uint64_t counts[256], uint64_t total) {

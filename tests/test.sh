@@ -19,12 +19,23 @@ with open(p+'/mixed','wb') as f:
     f.write(b'X'*(1024*1024))
     f.write(os.urandom(1024*1024))
     f.write(bytes((i & 255) for i in range(1024*1024)))
+with open(p+'/context','wb') as f:
+    x=0
+    out=bytearray(4_000_000)
+    for i in range(len(out)):
+        out[i]=x
+        x=(5*x+1)&255
+    f.write(out)
 PY
 
-for f in text skewed delta random mixed; do
+for f in text skewed delta random mixed context; do
     "$BIN" encode "$TMP/$f" -o "$TMP/$f.base9" --block-mib 1 --min-region-kib 64 --threads 2 >/dev/null
     "$BIN" decode "$TMP/$f.base9" -o "$TMP/$f.out" --threads 2 >/dev/null
     cmp "$TMP/$f" "$TMP/$f.out"
 done
+
+ctx_log="$TMP/context.log"
+"$BIN" encode "$TMP/context" -o "$TMP/context.check.base9" --block-mib 4 --min-region-kib 256 --threads 1 >"$ctx_log"
+grep -Eq 'context-rans=[1-9][0-9]*' "$ctx_log"
 
 echo "BASE9 round-trip tests PASS"

@@ -12,7 +12,289 @@
     return rc;
 }
 
-static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Method planned, uint32_t method_counts[4]) {
+static void normalize_context_freq(const uint32_t counts[256], uint32_t total, uint16_t freq[256], uint16_t cum[256]) {
+    unsigned used = 0;
+    for (int i = 0; i < 256; ++i) used += counts[i] != 0;
+    memset(freq, 0, 256 * sizeof(freq[0]));
+    memset(cum, 0, 256 * sizeof(cum[0]));
+    if (!used || !total) return;
+    if (used == 1) {
+        for (int i = 0; i < 256; ++i) {
+            if (counts[i]) { freq[i] = CONTEXT_TOTFREQ; break; }
+        }
+    } else {
+        uint32_t remaining = CONTEXT_TOTFREQ - used;
+        uint32_t assigned = 0;
+        uint64_t remainders[256] = {0};
+        for (int i = 0; i < 256; ++i) {
+            if (!counts[i]) continue;
+            uint64_t prod = (uint64_t)counts[i] * remaining;
+            uint32_t extra = (uint32_t)(prod / total);
+            remainders[i] = prod % total;
+            freq[i] = (uint16_t)(1u + extra);
+            assigned += 1u + extra;
+        }
+        while (assigned < CONTEXT_TOTFREQ) {
+            int best = -1;
+            uint64_t best_rem = 0;
+            for (int i = 0; i < 256; ++i) {
+                if (!counts[i]) continue;
+                if (best < 0 || remainders[i] > best_rem) {
+                    best = i;
+                    best_rem = remainders[i];
+                }
+            }
+            if (best < 0) break;
+            ++freq[best];
+            remainders[best] = 0;
+            ++assigned;
+        }
+    }
+    uint32_t c = 0;
+    for (int i = 0; i < 256; ++i) {
+        cum[i] = (uint16_t)c;
+        c += freq[i];
+    }
+}
+
+/*
+ * Order-1 context rANS.
+ *
+ * The probability table used for byte i is selected by byte i-1. This can
+ * compress streams whose global histogram is close to uniform when transitions
+ * remain predictable. The 8-bit rANS probability scale is intentional: it
+ * lets every possible 256-context model fit in the existing uint16 metadata
+ * length field.
+ *
+ * Metadata:
+ *   first byte                        1 byte
+ *   present-context bitmap          32 bytes
+ *   deterministic-context bitmap    32 bytes
+ *   for each present context, in byte order:
+ *      deterministic: predicted byte       1 byte
+ *      otherwise: frequencies 0..254     255 bytes
+ *                 (frequency 255 inferred)
+ *
+ * Worst case = 65,345 bytes, below UINT16_MAX.
+ */
+static int context_rans_try_encode(
+    const uint8_t *data,
+    size_t len,
+    size_t target_total,
+    ByteVec *meta,
+    ByteVec *payload
+) {
+    if (len < 2) return 1;
+
+    uint32_t *counts = calloc(256u * 256u, sizeof(*counts));
+    uint16_t *freq = calloc(256u * 256u, sizeof(*freq));
+    uint16_t *cum = calloc(256u * 256u, sizeof(*cum));
+    if (!counts || !freq || !cum) {
+        free(counts); free(freq); free(cum);
+        return -1;
+    }
+
+    uint32_t totals[256] = {0};
+    for (size_t i = 1; i < len; ++i) {
+        unsigned ctx = data[i - 1];
+        unsigned sym = data[i];
+        ++counts[(ctx << 8) | sym];
+        ++totals[ctx];
+    }
+
+    uint8_t present[32] = {0};
+    uint8_t deterministic[32] = {0};
+    if (bv_append_u8(meta, data[0]) != 0) goto oom;
+
+    for (int ctx = 0; ctx < 256; ++ctx) {
+        if (!totals[ctx]) continue;
+        present[ctx >> 3] |= (uint8_t)(1u << (ctx & 7));
+        unsigned used = 0;
+        for (int s = 0; s < 256; ++s)
+            used += counts[(ctx << 8) | s] != 0;
+        if (used == 1)
+            deterministic[ctx >> 3] |= (uint8_t)(1u << (ctx & 7));
+        normalize_context_freq(
+            counts + ((size_t)ctx << 8), totals[ctx],
+            freq + ((size_t)ctx << 8), cum + ((size_t)ctx << 8)
+        );
+    }
+
+    if (bv_append(meta, present, sizeof(present)) != 0 ||
+        bv_append(meta, deterministic, sizeof(deterministic)) != 0)
+        goto oom;
+
+    long double bits = 32.0L;
+    for (int ctx = 0; ctx < 256; ++ctx) {
+        if (!totals[ctx]) continue;
+        const uint32_t *row_counts = counts + ((size_t)ctx << 8);
+        const uint16_t *row_freq = freq + ((size_t)ctx << 8);
+        bool det = (deterministic[ctx >> 3] & (1u << (ctx & 7))) != 0;
+        if (det) {
+            int only = -1;
+            for (int s = 0; s < 256; ++s) {
+                if (row_counts[s]) { only = s; break; }
+            }
+            if (only < 0 || bv_append_u8(meta, (uint8_t)only) != 0) goto oom;
+        } else {
+            for (int s = 0; s < 255; ++s) {
+                if (row_freq[s] > 255 || bv_append_u8(meta, (uint8_t)row_freq[s]) != 0)
+                    goto oom;
+            }
+        }
+        for (int s = 0; s < 256; ++s) {
+            if (!row_counts[s]) continue;
+            if (!row_freq[s]) goto bad;
+            bits += (long double)row_counts[s] *
+                    ((long double)CONTEXT_SCALE_BITS - log2l((long double)row_freq[s]));
+        }
+    }
+
+    if (meta->len > UINT16_MAX) goto bad;
+    size_t estimated_payload = (size_t)ceill(bits / 8.0L);
+    if (estimated_payload > SIZE_MAX - REGION_HEADER_SIZE - meta->len) goto bad;
+    size_t estimated_total = REGION_HEADER_SIZE + meta->len + estimated_payload;
+    if (estimated_total >= target_total) {
+        free(counts); free(freq); free(cum);
+        bv_free(meta);
+        return 1;
+    }
+
+    if (len > (SIZE_MAX - 32) / 2) goto bad;
+    size_t cap = len * 2 + 32;
+    uint8_t *buf = malloc(cap);
+    if (!buf) goto oom;
+    uint8_t *ptr = buf + cap;
+    uint32_t state = RANS_L;
+
+    for (size_t ii = len; ii-- > 1;) {
+        unsigned ctx = data[ii - 1];
+        unsigned sym = data[ii];
+        uint32_t f = freq[(ctx << 8) | sym];
+        uint32_t c = cum[(ctx << 8) | sym];
+        if (!f) { free(buf); goto bad; }
+        uint32_t x_max = ((RANS_L >> CONTEXT_SCALE_BITS) << 8) * f;
+        while (state >= x_max) {
+            if (ptr == buf) { free(buf); goto bad; }
+            *--ptr = (uint8_t)state;
+            state >>= 8;
+        }
+        state = (state / f << CONTEXT_SCALE_BITS) + (state % f) + c;
+    }
+
+    if ((size_t)(ptr - buf) < 4) { free(buf); goto bad; }
+    ptr -= 4;
+    ptr[0] = (uint8_t)state;
+    ptr[1] = (uint8_t)(state >> 8);
+    ptr[2] = (uint8_t)(state >> 16);
+    ptr[3] = (uint8_t)(state >> 24);
+    size_t out_len = (size_t)((buf + cap) - ptr);
+    int rc = bv_append(payload, ptr, out_len);
+    free(buf);
+    free(counts); free(freq); free(cum);
+    if (rc != 0) { bv_free(meta); bv_free(payload); return -1; }
+    return 0;
+
+oom:
+    free(counts); free(freq); free(cum);
+    bv_free(meta); bv_free(payload);
+    return -1;
+bad:
+    free(counts); free(freq); free(cum);
+    bv_free(meta); bv_free(payload);
+    return 1;
+}
+
+static int context_rans_decode_region(
+    const uint8_t *meta,
+    size_t meta_len,
+    const uint8_t *payload,
+    size_t payload_len,
+    size_t out_len,
+    ByteVec *out
+) {
+    if (out_len < 2 || meta_len < 65 || payload_len < 4) return -1;
+    uint8_t first = meta[0];
+    const uint8_t *present = meta + 1;
+    const uint8_t *deterministic = meta + 33;
+    size_t mpos = 65;
+
+    uint16_t *freq = calloc(256u * 256u, sizeof(*freq));
+    uint16_t *cum = calloc(256u * 256u, sizeof(*cum));
+    uint8_t *lookup = malloc(256u * CONTEXT_TOTFREQ);
+    if (!freq || !cum || !lookup) {
+        free(freq); free(cum); free(lookup);
+        return -1;
+    }
+
+    for (int ctx = 0; ctx < 256; ++ctx) {
+        if (!(present[ctx >> 3] & (1u << (ctx & 7)))) continue;
+        uint16_t *rf = freq + ((size_t)ctx << 8);
+        uint16_t *rc = cum + ((size_t)ctx << 8);
+        bool det = (deterministic[ctx >> 3] & (1u << (ctx & 7))) != 0;
+        if (det) {
+            if (mpos >= meta_len) goto fail;
+            rf[meta[mpos++]] = CONTEXT_TOTFREQ;
+        } else {
+            if (meta_len - mpos < 255) goto fail;
+            uint32_t sum = 0;
+            for (int s = 0; s < 255; ++s) {
+                rf[s] = meta[mpos++];
+                sum += rf[s];
+            }
+            if (sum > CONTEXT_TOTFREQ) goto fail;
+            rf[255] = (uint16_t)(CONTEXT_TOTFREQ - sum);
+        }
+        uint32_t c = 0;
+        for (int s = 0; s < 256; ++s) {
+            rc[s] = (uint16_t)c;
+            if (rf[s]) {
+                for (uint32_t j = 0; j < rf[s]; ++j)
+                    lookup[((size_t)ctx << CONTEXT_SCALE_BITS) + c + j] = (uint8_t)s;
+                c += rf[s];
+            }
+        }
+        if (c != CONTEXT_TOTFREQ) goto fail;
+    }
+    if (mpos != meta_len) goto fail;
+
+    size_t start = out->len;
+    if (bv_reserve(out, out_len) != 0) goto fail;
+    out->len += out_len;
+    out->data[start] = first;
+
+    uint32_t state = rd_u32(payload);
+    const uint8_t *ptr = payload + 4;
+    const uint8_t *end = payload + payload_len;
+    uint8_t prev = first;
+    for (size_t i = 1; i < out_len; ++i) {
+        unsigned ctx = prev;
+        if (!(present[ctx >> 3] & (1u << (ctx & 7)))) goto fail_out;
+        uint32_t slot = state & (CONTEXT_TOTFREQ - 1u);
+        uint8_t sym = lookup[((size_t)ctx << CONTEXT_SCALE_BITS) + slot];
+        uint32_t f = freq[(ctx << 8) | sym];
+        uint32_t c = cum[(ctx << 8) | sym];
+        if (!f) goto fail_out;
+        state = f * (state >> CONTEXT_SCALE_BITS) + slot - c;
+        while (state < RANS_L) {
+            if (ptr >= end) goto fail_out;
+            state = (state << 8) | *ptr++;
+        }
+        out->data[start + i] = sym;
+        prev = sym;
+    }
+    if (ptr != end) goto fail_out;
+    free(freq); free(cum); free(lookup);
+    return 0;
+
+fail_out:
+    out->len = start;
+fail:
+    free(freq); free(cum); free(lookup);
+    return -1;
+}
+
+static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Method planned, uint32_t method_counts[METHOD_COUNT]) {
     ByteVec meta = {0}, payload = {0};
     enum Method method = planned;
     int rc = 0;
@@ -21,12 +303,31 @@ static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Me
     else if (method == METHOD_DELTA_RANS) rc = rans_encode(data, len, true, &meta, &payload);
     if (rc != 0) { bv_free(&meta); bv_free(&payload); return -1; }
 
-    size_t encoded_total = REGION_HEADER_SIZE + meta.len + payload.len;
     size_t raw_total = REGION_HEADER_SIZE + len;
-    if (method != METHOD_RAW && encoded_total >= raw_total) {
+    size_t best_total = method == METHOD_RAW ? raw_total : REGION_HEADER_SIZE + meta.len + payload.len;
+    if (method != METHOD_RAW && best_total >= raw_total) {
         bv_free(&meta); bv_free(&payload);
         method = METHOD_RAW;
+        best_total = raw_total;
     }
+
+    ByteVec ctx_meta = {0}, ctx_payload = {0};
+    int ctx_rc = context_rans_try_encode(data, len, best_total, &ctx_meta, &ctx_payload);
+    if (ctx_rc < 0) {
+        bv_free(&meta); bv_free(&payload);
+        return -1;
+    }
+    if (ctx_rc == 0) {
+        size_t ctx_total = REGION_HEADER_SIZE + ctx_meta.len + ctx_payload.len;
+        if (ctx_total < best_total) {
+            bv_free(&meta); bv_free(&payload);
+            meta = ctx_meta; payload = ctx_payload;
+            ctx_meta = (ByteVec){0}; ctx_payload = (ByteVec){0};
+            method = METHOD_CONTEXT_RANS;
+            best_total = ctx_total;
+        }
+    }
+    bv_free(&ctx_meta); bv_free(&ctx_payload);
     if (method == METHOD_RAW) {
         if (bv_append_u8(body, (uint8_t)METHOD_RAW) != 0 || bv_append_u8(body, 0) != 0 || bv_append_u16(body, 0) != 0 ||
             bv_append_u32(body, (uint32_t)len) != 0 || bv_append_u32(body, (uint32_t)len) != 0 || bv_append_u32(body, crc32_bytes(data, len)) != 0 ||
@@ -45,7 +346,7 @@ static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Me
     return 0;
 }
 
-static int encode_plan_regions(ByteVec *body, const uint8_t *block, const PlanNode *node, uint32_t method_counts[4]) {
+static int encode_plan_regions(ByteVec *body, const uint8_t *block, const PlanNode *node, uint32_t method_counts[METHOD_COUNT]) {
     if (node->left) {
         if (encode_plan_regions(body, block, node->left, method_counts) != 0) return -1;
         return encode_plan_regions(body, block, node->right, method_counts);
@@ -182,6 +483,7 @@ static int decode_block(DecodeJob *job) {
         } else if (method == METHOD_BASE) rc = decode_base_region(meta, meta_len, payload, payload_len, raw_len, &job->decoded);
         else if (method == METHOD_RANS) rc = rans_decode_region(meta, meta_len, payload, payload_len, raw_len, false, &job->decoded);
         else if (method == METHOD_DELTA_RANS) rc = rans_decode_region(meta, meta_len, payload, payload_len, raw_len, true, &job->decoded);
+        else if (method == METHOD_CONTEXT_RANS) rc = context_rans_decode_region(meta, meta_len, payload, payload_len, raw_len, &job->decoded);
         if (rc != 0 || job->decoded.len - before != raw_len) return -1;
         if (crc32_bytes(job->decoded.data + before, raw_len) != expected_crc) return -1;
     }

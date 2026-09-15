@@ -77,7 +77,7 @@ static int encode_file(const char *src, const char *dst, size_t block_size, size
     FILE *out = fopen(dst, "wb"); if (!out) { perror("open output"); fclose(in); return 1; }
     if (write_file_header(out, total_size, (uint32_t)block_size, (uint32_t)min_region) != 0) { fprintf(stderr, "header write failed\n"); fclose(in); fclose(out); return 1; }
     printf("BASE9 encode: block=%zu MiB, min-region=%zu KiB, threads=%u\n", block_size >> 20, min_region >> 10, threads);
-    double start = now_seconds(); uint64_t done = 0; uint64_t total_regions = 0; uint64_t methods[4] = {0};
+    double start = now_seconds(); uint64_t done = 0; uint64_t total_regions = 0; uint64_t methods[METHOD_COUNT] = {0};
     while (done < total_size) {
         unsigned batch = threads;
         uint64_t remain_blocks = (total_size - done + block_size - 1) / block_size;
@@ -98,19 +98,19 @@ static int encode_file(const char *src, const char *dst, size_t block_size, size
             if (jobs[i].error || fwrite(jobs[i].encoded.data, 1, jobs[i].encoded.len, out) != jobs[i].encoded.len) {
                 fprintf(stderr, "encode/write failed: %s\n", jobs[i].error_msg); for (unsigned j=0;j<batch;++j){free(jobs[j].input);bv_free(&jobs[j].encoded);} free(jobs);free(tids);fclose(in);fclose(out);return 1;
             }
-            total_regions += jobs[i].region_count; for (int m=0;m<4;++m) methods[m] += jobs[i].method_counts[m];
+            total_regions += jobs[i].region_count; for (int m=0;m<METHOD_COUNT;++m) methods[m] += jobs[i].method_counts[m];
             free(jobs[i].input); bv_free(&jobs[i].encoded);
         }
         free(jobs); free(tids);
         double pct = total_size ? 100.0 * (double)done / (double)total_size : 100.0;
-        printf("\rEncoding: %6.2f%% | regions=%" PRIu64 " | raw=%" PRIu64 " base=%" PRIu64 " rans=%" PRIu64 " delta=%" PRIu64, pct, total_regions, methods[0], methods[1], methods[2], methods[3]); fflush(stdout);
+        printf("\rEncoding: %6.2f%% | regions=%" PRIu64 " | raw=%" PRIu64 " base=%" PRIu64 " rans=%" PRIu64 " delta=%" PRIu64 " ctx=%" PRIu64, pct, total_regions, methods[0], methods[1], methods[2], methods[3], methods[4]); fflush(stdout);
     }
     printf("\n");
     if (fclose(in) != 0 || fclose(out) != 0) { perror("close"); return 1; }
     uint64_t out_size = file_size_of(dst); double elapsed = now_seconds() - start;
     printf("BASE9 encode complete\nInput:       %" PRIu64 " bytes\nOutput:      %" PRIu64 " bytes\n", total_size, out_size);
     if (total_size) printf("Ratio:       %.4fx (%.2f%% of original)\n", (double)out_size/total_size, 100.0*(double)out_size/total_size);
-    printf("Regions:     %" PRIu64 " (raw=%" PRIu64 ", base=%" PRIu64 ", rans=%" PRIu64 ", delta-rans=%" PRIu64 ")\nThreads:     %u\nElapsed:     %.3f s\nThroughput:  %.2f MiB/s\nCreated:     %s\n", total_regions, methods[0], methods[1], methods[2], methods[3], threads, elapsed, elapsed>0 ? (double)total_size/(1024.0*1024.0)/elapsed : 0.0, dst);
+    printf("Regions:     %" PRIu64 " (raw=%" PRIu64 ", base=%" PRIu64 ", rans=%" PRIu64 ", delta-rans=%" PRIu64 ", context-rans=%" PRIu64 ")\nThreads:     %u\nElapsed:     %.3f s\nThroughput:  %.2f MiB/s\nCreated:     %s\n", total_regions, methods[0], methods[1], methods[2], methods[3], methods[4], threads, elapsed, elapsed>0 ? (double)total_size/(1024.0*1024.0)/elapsed : 0.0, dst);
     return 0;
 }
 
@@ -118,7 +118,9 @@ static int read_exact(FILE *f, void *buf, size_t n) { return fread(buf, 1, n, f)
 
 static int decode_file(const char *src, const char *dst, unsigned requested_threads) {
     FILE *in = fopen(src, "rb"); if (!in) { perror("open input"); return 1; }
-    uint8_t h[FILE_HEADER_SIZE]; if (read_exact(in, h, sizeof(h)) != 0 || memcmp(h, FILE_MAGIC, 8) != 0 || rd_u32(h+8) != BASE9_VERSION || rd_u32(h+12) != FILE_HEADER_SIZE) { fprintf(stderr, "Not a supported BASE9 file.\n"); fclose(in); return 1; }
+    uint8_t h[FILE_HEADER_SIZE]; if (read_exact(in, h, sizeof(h)) != 0 || memcmp(h, FILE_MAGIC, 8) != 0 || rd_u32(h+12) != FILE_HEADER_SIZE) { fprintf(stderr, "Not a supported BASE9 file.\n"); fclose(in); return 1; }
+    uint32_t version = rd_u32(h+8);
+    if (version < BASE9_MIN_VERSION || version > BASE9_VERSION) { fprintf(stderr, "Unsupported BASE9 version: %u\n", version); fclose(in); return 1; }
     uint64_t original_size = rd_u64(h+16); uint32_t block_size = rd_u32(h+24); uint32_t min_region = rd_u32(h+28); (void)min_region;
     uint64_t blocks = original_size ? (original_size + block_size - 1) / block_size : 0;
     unsigned threads = auto_threads(block_size, requested_threads, blocks);
@@ -155,7 +157,7 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage:\n  %s encode INPUT [-o OUTPUT] [--block-mib N] [--min-region-kib N] [--threads N]\n  %s decode INPUT [-o OUTPUT] [--threads N]\n\n"
         "BASE9 is a bounded-RAM adaptive compressor. It chooses per region among\n"
-        "RAW, adaptive-base packing, static rANS frequency coding, and delta+rANS,\n"
+        "RAW, adaptive-base packing, static rANS, delta+rANS, and order-1 context rANS,\n"
         "and recursively splits large blocks when local statistics compress better.\n", argv0, argv0);
 }
 

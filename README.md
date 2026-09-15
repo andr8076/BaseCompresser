@@ -10,6 +10,7 @@ Current region methods:
 - **Adaptive base** — if a region uses a small byte alphabet, remap those bytes to base-N digits and pack groups with native 64-bit arithmetic.
 - **rANS** — static frequency coding lets a region compress even when all 256 byte values occur, as long as their frequencies are uneven.
 - **Delta + rANS** — a reversible first-order delta transform exposes structure in counters, samples, geometry, and other locally correlated byte streams before frequency coding.
+- **Order-1 context rANS** — models the next-byte distribution separately for each previous byte. This can compress data whose global byte histogram is almost uniform when byte-to-byte transitions remain predictable.
 
 The encoder starts with large blocks (64 MiB by default) and uses a dynamic split plan down to 256 KiB regions. A split is kept only when the estimated encoded representation of the children beats the parent after metadata/header costs.
 
@@ -45,13 +46,15 @@ BASE9 adds probability/frequency coding. A region can therefore use all 256 byte
 
 ## Format status
 
-The BASE9 container is experimental and versioned. Exact round-trip integrity is protected with CRC32 at both region and block level. The format may change while the compression model is being developed.
+The BASE9 container is experimental and versioned. Current encodes use format version 2; the decoder remains backward-compatible with version 1. Exact round-trip integrity is protected with CRC32 at both region and block level. The format may change while the compression model is being developed.
 
 ## Next performance/compression work
 
 - SIMD histogram and transform kernels (AVX2 first)
 - persistent worker pool instead of one pthread batch per set of blocks
 - denser rANS model serialization
-- stronger context models beyond the current delta transform
+- integrate context-cost estimates directly into the adaptive split planner
+- denser/higher-resolution context probability models
+- higher-order and mixed context models
 - content-defined region boundaries rather than boundaries limited to the minimum-region grid
 - benchmark corpus and regression thresholds

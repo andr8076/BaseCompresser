@@ -12,12 +12,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#define BASE9_VERSION 1u
+#define BASE9_VERSION 2u
+#define BASE9_MIN_VERSION 1u
 #define DEFAULT_BLOCK_MIB 64u
 #define DEFAULT_MIN_REGION_KIB 256u
 #define RANS_SCALE_BITS 12u
 #define RANS_TOTFREQ (1u << RANS_SCALE_BITS)
 #define RANS_L (1u << 23)
+#define CONTEXT_SCALE_BITS 8u
+#define CONTEXT_TOTFREQ (1u << CONTEXT_SCALE_BITS)
 #define REGION_HEADER_SIZE 16u
 #define BLOCK_HEADER_SIZE 24u
 #define FILE_HEADER_SIZE 40u
@@ -30,6 +33,8 @@ enum Method {
     METHOD_BASE = 1,
     METHOD_RANS = 2,
     METHOD_DELTA_RANS = 3,
+    METHOD_CONTEXT_RANS = 4,
+    METHOD_COUNT = 5,
 };
 
 typedef struct {
@@ -62,7 +67,7 @@ typedef struct {
     size_t min_region;
     ByteVec encoded;
     uint32_t region_count;
-    uint32_t method_counts[4];
+    uint32_t method_counts[METHOD_COUNT];
     int error;
     char error_msg[160];
 } EncodeJob;

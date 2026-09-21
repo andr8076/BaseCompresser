@@ -12,7 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define BASE9_VERSION 2u
+#define BASE9_VERSION 3u
 #define BASE9_MIN_VERSION 1u
 #define DEFAULT_BLOCK_MIB 64u
 #define DEFAULT_MIN_REGION_KIB 256u
@@ -34,7 +34,8 @@ enum Method {
     METHOD_RANS = 2,
     METHOD_DELTA_RANS = 3,
     METHOD_CONTEXT_RANS = 4,
-    METHOD_COUNT = 5,
+    METHOD_TOKEN_BASE = 5,
+    METHOD_COUNT = 6,
 };
 
 typedef struct {
@@ -126,6 +127,8 @@ static int bv_reserve(ByteVec *v, size_t extra) {
 }
 
 static int bv_append(ByteVec *v, const void *src, size_t n) {
+    if (n == 0) return 0;
+    if (!src) return -1;
     if (bv_reserve(v, n) != 0) return -1;
     memcpy(v->data + v->len, src, n);
     v->len += n;

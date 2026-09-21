@@ -12,6 +12,8 @@
     return rc;
 }
 
+#include "base9_part_token.inc"
+
 static void normalize_context_freq(const uint32_t counts[256], uint32_t total, uint16_t freq[256], uint16_t cum[256]) {
     unsigned used = 0;
     for (int i = 0; i < 256; ++i) used += counts[i] != 0;
@@ -328,6 +330,27 @@ static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Me
         }
     }
     bv_free(&ctx_meta); bv_free(&ctx_payload);
+
+    ByteVec token_meta = {0}, token_payload = {0};
+    int token_rc = token_base_try_encode(
+        data, len, best_total, &token_meta, &token_payload);
+    if (token_rc < 0) {
+        bv_free(&meta); bv_free(&payload);
+        return -1;
+    }
+    if (token_rc == 0) {
+        size_t token_total =
+            REGION_HEADER_SIZE + token_meta.len + token_payload.len;
+        if (token_total < best_total) {
+            bv_free(&meta); bv_free(&payload);
+            meta = token_meta; payload = token_payload;
+            token_meta = (ByteVec){0}; token_payload = (ByteVec){0};
+            method = METHOD_TOKEN_BASE;
+            best_total = token_total;
+        }
+    }
+    bv_free(&token_meta); bv_free(&token_payload);
+
     if (method == METHOD_RAW) {
         if (bv_append_u8(body, (uint8_t)METHOD_RAW) != 0 || bv_append_u8(body, 0) != 0 || bv_append_u16(body, 0) != 0 ||
             bv_append_u32(body, (uint32_t)len) != 0 || bv_append_u32(body, (uint32_t)len) != 0 || bv_append_u32(body, crc32_bytes(data, len)) != 0 ||
@@ -484,6 +507,7 @@ static int decode_block(DecodeJob *job) {
         else if (method == METHOD_RANS) rc = rans_decode_region(meta, meta_len, payload, payload_len, raw_len, false, &job->decoded);
         else if (method == METHOD_DELTA_RANS) rc = rans_decode_region(meta, meta_len, payload, payload_len, raw_len, true, &job->decoded);
         else if (method == METHOD_CONTEXT_RANS) rc = context_rans_decode_region(meta, meta_len, payload, payload_len, raw_len, &job->decoded);
+        else if (method == METHOD_TOKEN_BASE) rc = token_base_decode_region(meta, meta_len, payload, payload_len, raw_len, &job->decoded);
         if (rc != 0 || job->decoded.len - before != raw_len) return -1;
         if (crc32_bytes(job->decoded.data + before, raw_len) != expected_crc) return -1;
     }

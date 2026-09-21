@@ -39,6 +39,46 @@ Useful controls:
 
 If `--threads` is omitted, BASE9 chooses a worker count from CPU availability and available RAM. Memory scales with block size × active workers, not total file size.
 
+## GPU token discovery
+
+BASE9 can accelerate token pair histograms with OpenCL while keeping token
+selection and adaptive-base packing on the CPU. The same kernel path is used
+for NVIDIA, AMD, and Intel OpenCL devices. GPU support is optional: if no
+usable OpenCL GPU exists, compression automatically keeps using the CPU.
+
+```bash
+./basecompresser gpu-info
+```
+
+Useful environment controls:
+
+```bash
+BASECOMPRESSER_GPU=off ./basecompresser encode input.bin
+BASECOMPRESSER_GPU=force ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_VENDOR=nvidia ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_VENDOR=amd ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_VENDOR=intel ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_MIN_KIB=2048 ./basecompresser encode input.bin
+```
+
+AUTO uses GPU pair counting for sufficiently large scans on normal OpenCL
+devices. The validated Skylake/P530 private-compatibility path is intentionally
+CPU-first in AUTO because its current global-atomic histogram kernel measured
+slower than the CPU implementation; `BASECOMPRESSER_GPU=force` still enables
+it for testing or future kernels.
+
+For the same Skylake/Gen9 hosts supported by 265Encode's legacy Intel path,
+BaseCompresser can prepare a private OpenCL compute runtime without installing
+packages into `/usr` or `/etc`:
+
+```bash
+./tools/setup-intel-legacy-opencl.sh
+./basecompresser gpu-info
+```
+
+The helper uses the same Intel Gen9/i915 PCI-device detection policy as
+265Encode and stores the extracted runtime under the user's cache directory.
+
 ## Why BASE9 differs from BASE8
 
 BASE8 only gained from a reduced alphabet. If a block contained all 256 byte values it normally fell back to RAW, even when one value was vastly more common than another.

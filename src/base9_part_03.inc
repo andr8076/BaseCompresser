@@ -111,6 +111,7 @@ static int encode_file(const char *src, const char *dst, size_t block_size, size
     printf("BASE9 encode complete\nInput:       %" PRIu64 " bytes\nOutput:      %" PRIu64 " bytes\n", total_size, out_size);
     if (total_size) printf("Ratio:       %.4fx (%.2f%% of original)\n", (double)out_size/total_size, 100.0*(double)out_size/total_size);
     printf("Regions:     %" PRIu64 " (raw=%" PRIu64 ", base=%" PRIu64 ", rans=%" PRIu64 ", delta-rans=%" PRIu64 ", context-rans=%" PRIu64 ", token-base=%" PRIu64 ")\nThreads:     %u\nElapsed:     %.3f s\nThroughput:  %.2f MiB/s\nCreated:     %s\n", total_regions, methods[0], methods[1], methods[2], methods[3], methods[4], methods[5], threads, elapsed, elapsed>0 ? (double)total_size/(1024.0*1024.0)/elapsed : 0.0, dst);
+    base9_gpu_report_usage();
     return 0;
 }
 
@@ -155,13 +156,19 @@ static int decode_file(const char *src, const char *dst, unsigned requested_thre
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage:\n  %s encode INPUT [-o OUTPUT] [--block-mib N] [--min-region-kib N] [--threads N]\n  %s decode INPUT [-o OUTPUT] [--threads N]\n\n"
+        "Usage:\n  %s encode INPUT [-o OUTPUT] [--block-mib N] [--min-region-kib N] [--threads N]\n  %s decode INPUT [-o OUTPUT] [--threads N]\n  %s gpu-info\n\n"
         "BASE9 is a bounded-RAM adaptive compressor. It chooses per region among\n"
         "RAW, adaptive-base packing, token-base, static rANS, delta+rANS, and context rANS,\n"
-        "and recursively splits large blocks when local statistics compress better.\n", argv0, argv0);
+        "and recursively splits large blocks when local statistics compress better.\n"
+        "GPU token discovery uses OpenCL when available and always has CPU fallback.\n", argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
+    base9_gpu_maybe_reexec_private_intel(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "gpu-info") == 0) {
+        base9_gpu_print_info();
+        return base9_gpu.available ? 0 : 1;
+    }
     if (argc < 3) { usage(argv[0]); return 2; }
     bool enc = strcmp(argv[1], "encode") == 0, dec = strcmp(argv[1], "decode") == 0;
     if (!enc && !dec) { usage(argv[0]); return 2; }

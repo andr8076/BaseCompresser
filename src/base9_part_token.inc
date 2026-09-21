@@ -296,6 +296,11 @@ static void token_count_pairs(
     size_t symbol_count,
     uint32_t *pair_counts
 ) {
+    if (symbol_count >= 2 &&
+        base9_gpu_pair_count_u16(
+            symbols, symbol_count, pair_counts, TOKEN_SYMBOL_CAP) == 0)
+        return;
+
     memset(pair_counts, 0,
            (size_t)TOKEN_SYMBOL_CAP * TOKEN_SYMBOL_CAP * sizeof(*pair_counts));
     if (symbol_count < 2)
@@ -333,7 +338,11 @@ static int token_base_try_encode(
             raw_used[data[i]] = true;
             ++raw_distinct;
         }
-        if (i + 1 < len) {
+    }
+
+    if (base9_gpu_pair_count_u8(
+            data, len, pair_counts, TOKEN_SYMBOL_CAP) != 0) {
+        for (size_t i = 0; i + 1 < len; ++i) {
             unsigned a = data[i], b = data[i + 1];
             uint32_t *slot =
                 &pair_counts[(size_t)a * TOKEN_SYMBOL_CAP + b];

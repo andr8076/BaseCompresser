@@ -26,9 +26,16 @@ with open(p+'/context','wb') as f:
         out[i]=x
         x=(5*x+1)&255
     f.write(out)
+with open(p+'/tokens','wb') as f:
+    for i in range(100_000):
+        f.write(b'RECORD:')
+        f.write((i & 0xffffffff).to_bytes(4,'little'))
+        f.write(b':VALUE:')
+        f.write(((i*2654435761)&0xffffffff).to_bytes(4,'little'))
+        f.write(b'\n')
 PY
 
-for f in text skewed delta random mixed context; do
+for f in text skewed delta random mixed context tokens; do
     "$BIN" encode "$TMP/$f" -o "$TMP/$f.base9" --block-mib 1 --min-region-kib 64 --threads 2 >/dev/null
     "$BIN" decode "$TMP/$f.base9" -o "$TMP/$f.out" --threads 2 >/dev/null
     cmp "$TMP/$f" "$TMP/$f.out"
@@ -37,5 +44,9 @@ done
 ctx_log="$TMP/context.log"
 "$BIN" encode "$TMP/context" -o "$TMP/context.check.base9" --block-mib 4 --min-region-kib 256 --threads 1 >"$ctx_log"
 grep -Eq 'context-rans=[1-9][0-9]*' "$ctx_log"
+
+token_log="$TMP/tokens.log"
+"$BIN" encode "$TMP/tokens" -o "$TMP/tokens.check.base9" --block-mib 4 --min-region-kib 256 --threads 1 >"$token_log"
+grep -Eq 'token-base=[1-9][0-9]*' "$token_log"
 
 echo "BASE9 round-trip tests PASS"

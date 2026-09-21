@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+: "${BASECOMPRESSER_GPU:=off}"
+export BASECOMPRESSER_GPU
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/basecompresser"
 TMP="$(mktemp -d)"

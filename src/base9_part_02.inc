@@ -12,6 +12,7 @@
     return rc;
 }
 
+#include "base9_gpu_opencl.inc"
 #include "base9_part_token.inc"
 
 static void normalize_context_freq(const uint32_t counts[256], uint32_t total, uint16_t freq[256], uint16_t cum[256]) {

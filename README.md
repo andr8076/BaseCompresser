@@ -8,6 +8,7 @@ Current region methods:
 
 - **RAW** — incompressible data is copied without pointless expansion.
 - **Adaptive base** — if a region uses a small byte alphabet, remap those bytes to base-N digits and pack groups with native 64-bit arithmetic.
+- **Token base** — discover repeated 2–8 byte sequences, turn them into super-symbols, and pack the shorter symbol stream as digits in an adaptive base.
 - **rANS** — static frequency coding lets a region compress even when all 256 byte values occur, as long as their frequencies are uneven.
 - **Delta + rANS** — a reversible first-order delta transform exposes structure in counters, samples, geometry, and other locally correlated byte streams before frequency coding.
 - **Order-1 context rANS** — models the next-byte distribution separately for each previous byte. This can compress data whose global byte histogram is almost uniform when byte-to-byte transitions remain predictable.
@@ -46,10 +47,21 @@ BASE9 adds probability/frequency coding. A region can therefore use all 256 byte
 
 ## Format status
 
-The BASE9 container is experimental and versioned. Current encodes use format version 2; the decoder remains backward-compatible with version 1. Exact round-trip integrity is protected with CRC32 at both region and block level. The format may change while the compression model is being developed.
+The BASE9 container is experimental and versioned. Current encodes use format version 3; the decoder remains backward-compatible with versions 1 and 2. Exact round-trip integrity is protected with CRC32 at both region and block level. The format may change while the compression model is being developed.
+
+## Token-base direction
+
+Token-base is the project-specific path: repeated byte sequences become digits.
+The current implementation uses three bounded pair-merge rounds, so useful
+2-byte tokens can recursively become 4-byte and then 8-byte super-symbols.
+Token-base is accepted only when its dictionary plus radix-packed payload beats
+the best competing representation for that region.
 
 ## Next performance/compression work
 
+- token-aware region split costs and content-defined token boundaries
+- faster token discovery / pair counting (SIMD and persistent scratch buffers)
+- wider token dictionaries and longer super-symbols when they prove profitable
 - SIMD histogram and transform kernels (AVX2 first)
 - persistent worker pool instead of one pthread batch per set of blocks
 - denser rANS model serialization

@@ -136,7 +136,7 @@ avoiding repeated conversion work.
 ## Next performance/compression work
 
 - token-aware region split costs and content-defined token boundaries
-- SIMD CPU token scans for systems where GPU offload is not profitable
+- continue profiling CPU token discovery; the current exact pair counter is branch-free and four-way unrolled after AVX2 gather/scatter variants benchmarked slower on Skylake
 - wider token dictionaries and longer super-symbols when they prove profitable
 - SIMD histogram and transform kernels (AVX2 first)
 - denser rANS model serialization

@@ -1,3 +1,6 @@
+#include <fcntl.h>
+#include <sys/wait.h>
+
 static uint64_t file_size_of(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0 || st.st_size < 0) return UINT64_MAX;
@@ -528,13 +531,307 @@ static int decode_file(const char *src, const char *dst, unsigned requested_thre
     double elapsed=now_seconds()-start; printf("BASE9 decode complete\nOutput:      %" PRIu64 " bytes\nThreads:     %u\nElapsed:     %.3f s\nThroughput:  %.2f MiB/s\nCreated:     %s\n",written,threads,elapsed,elapsed>0?(double)written/(1024.0*1024.0)/elapsed:0.0,dst); return 0;
 }
 
+static int gpu_bench_generate_input(const char *path, size_t bytes) {
+    uint8_t *buf = malloc(bytes);
+    if (!buf)
+        return -1;
+
+    static const uint8_t prefix[] = "RECORD:";
+    static const uint8_t middle[] = ":VALUE:";
+    size_t pos = 0;
+    uint32_t i = 0;
+
+    while (pos + 23u <= bytes) {
+        memcpy(buf + pos, prefix, sizeof(prefix) - 1);
+        pos += sizeof(prefix) - 1;
+
+        uint32_t a = i;
+        buf[pos++] = (uint8_t)a;
+        buf[pos++] = (uint8_t)(a >> 8);
+        buf[pos++] = (uint8_t)(a >> 16);
+        buf[pos++] = (uint8_t)(a >> 24);
+
+        memcpy(buf + pos, middle, sizeof(middle) - 1);
+        pos += sizeof(middle) - 1;
+
+        uint32_t b = i * 2654435761u;
+        buf[pos++] = (uint8_t)b;
+        buf[pos++] = (uint8_t)(b >> 8);
+        buf[pos++] = (uint8_t)(b >> 16);
+        buf[pos++] = (uint8_t)(b >> 24);
+        buf[pos++] = '\n';
+        ++i;
+    }
+
+    while (pos < bytes) {
+        buf[pos] = (uint8_t)((pos * 37u + 11u) & 255u);
+        ++pos;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        free(buf);
+        return -1;
+    }
+    size_t wrote = fwrite(buf, 1, bytes, f);
+    int rc = fclose(f);
+    free(buf);
+    return wrote == bytes && rc == 0 ? 0 : -1;
+}
+
+static bool gpu_bench_files_equal(const char *a_path, const char *b_path) {
+    FILE *a = fopen(a_path, "rb");
+    FILE *b = fopen(b_path, "rb");
+    if (!a || !b) {
+        if (a) fclose(a);
+        if (b) fclose(b);
+        return false;
+    }
+
+    uint8_t ab[64 * 1024], bb[64 * 1024];
+    bool equal = true;
+    for (;;) {
+        size_t an = fread(ab, 1, sizeof(ab), a);
+        size_t bn = fread(bb, 1, sizeof(bb), b);
+        if (an != bn || (an && memcmp(ab, bb, an) != 0)) {
+            equal = false;
+            break;
+        }
+        if (an == 0) {
+            if (ferror(a) || ferror(b))
+                equal = false;
+            break;
+        }
+    }
+
+    fclose(a);
+    fclose(b);
+    return equal;
+}
+
+static int gpu_bench_child(
+    const char *input,
+    const char *output,
+    unsigned threads,
+    unsigned mode,
+    double *elapsed
+) {
+    char threads_s[32];
+    snprintf(threads_s, sizeof(threads_s), "%u", threads);
+
+    double start = now_seconds();
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+
+    if (pid == 0) {
+        setenv("BASECOMPRESSER_PIPELINE_EXTRA", "4", 1);
+        setenv("BASECOMPRESSER_GPU_ZERO_COPY", "off", 1);
+
+        if (mode == 0) {
+            setenv("BASECOMPRESSER_GPU", "off", 1);
+            unsetenv("BASECOMPRESSER_GPU_HIST");
+            unsetenv("BASECOMPRESSER_GPU_PACK");
+        } else {
+            setenv("BASECOMPRESSER_GPU", "force", 1);
+            if (mode == 1) {
+                setenv("BASECOMPRESSER_GPU_HIST", "sharded", 1);
+                setenv("BASECOMPRESSER_GPU_PACK", "off", 1);
+            } else if (mode == 2) {
+                setenv("BASECOMPRESSER_GPU_HIST", "cpu", 1);
+                setenv("BASECOMPRESSER_GPU_PACK", "force", 1);
+            } else {
+                setenv("BASECOMPRESSER_GPU_HIST", "sharded", 1);
+                setenv("BASECOMPRESSER_GPU_PACK", "force", 1);
+            }
+        }
+
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            close(devnull);
+        }
+
+        execl(
+            "/proc/self/exe",
+            "basecompresser",
+            "encode",
+            input,
+            "-o", output,
+            "--block-mib", "8",
+            "--min-region-kib", "8192",
+            "--threads", threads_s,
+            (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid)
+        return -1;
+    *elapsed = now_seconds() - start;
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+static int gpu_bench_mode(
+    const char *input,
+    const char *output,
+    unsigned threads,
+    unsigned mode,
+    double *average
+) {
+    double sum = 0.0;
+    for (unsigned run = 0; run < 2; ++run) {
+        double elapsed = 0.0;
+        if (gpu_bench_child(
+                input, output, threads, mode, &elapsed) != 0)
+            return -1;
+        sum += elapsed;
+    }
+    *average = sum / 2.0;
+    return 0;
+}
+
+static int gpu_bench(void) {
+    if (base9_gpu_init() != 0) {
+        fprintf(stderr, "No usable OpenCL GPU is available.\n");
+        return 1;
+    }
+
+    printf("BASE9 GPU calibration\n"
+           "Vendor:  %s\n"
+           "Device:  %s\n"
+           "Driver:  %s\n",
+           base9_gpu.vendor, base9_gpu.name, base9_gpu.driver);
+
+    char input_path[] = "/tmp/basecompresser-gpu-bench-input-XXXXXX";
+    char cpu_path[] = "/tmp/basecompresser-gpu-bench-cpu-XXXXXX";
+    char test_path[] = "/tmp/basecompresser-gpu-bench-test-XXXXXX";
+
+    int input_fd = mkstemp(input_path);
+    int cpu_fd = mkstemp(cpu_path);
+    int test_fd = mkstemp(test_path);
+    if (input_fd < 0 || cpu_fd < 0 || test_fd < 0) {
+        if (input_fd >= 0) close(input_fd);
+        if (cpu_fd >= 0) close(cpu_fd);
+        if (test_fd >= 0) close(test_fd);
+        if (input_fd >= 0) unlink(input_path);
+        if (cpu_fd >= 0) unlink(cpu_path);
+        if (test_fd >= 0) unlink(test_path);
+        perror("gpu-bench temporary file");
+        return 1;
+    }
+    close(input_fd);
+    close(cpu_fd);
+    close(test_fd);
+
+    const size_t bench_bytes = 64u * 1024u * 1024u;
+    if (gpu_bench_generate_input(input_path, bench_bytes) != 0) {
+        fprintf(stderr, "Failed to generate GPU benchmark input.\n");
+        unlink(input_path);
+        unlink(cpu_path);
+        unlink(test_path);
+        return 1;
+    }
+
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned threads = (unsigned)(cpus > 0 ? cpus : 1);
+    if (threads > 4)
+        threads = 4;
+    if (threads < 1)
+        threads = 1;
+
+    static const char *names[4] = {
+        "CPU only",
+        "GPU histograms",
+        "GPU radix",
+        "GPU histograms + radix"
+    };
+    double times[4] = {0};
+
+    printf("Corpus:  64 MiB token-heavy, 8 MiB blocks, %u workers\n",
+           threads);
+
+    int failed = 0;
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        const char *out = mode == 0 ? cpu_path : test_path;
+        if (gpu_bench_mode(
+                input_path, out, threads, mode, &times[mode]) != 0) {
+            fprintf(stderr, "Calibration mode failed: %s\n", names[mode]);
+            failed = 1;
+            break;
+        }
+
+        if (mode != 0 && !gpu_bench_files_equal(cpu_path, test_path)) {
+            fprintf(stderr,
+                    "Calibration aborted: %s produced different BASE9 bytes.\n",
+                    names[mode]);
+            failed = 1;
+            break;
+        }
+
+        printf("%-24s %.3f s  (%.2f MiB/s)\n",
+               names[mode],
+               times[mode],
+               64.0 / times[mode]);
+    }
+
+    if (failed) {
+        unlink(input_path);
+        unlink(cpu_path);
+        unlink(test_path);
+        return 1;
+    }
+
+    unsigned best = 0;
+    for (unsigned mode = 1; mode < 4; ++mode) {
+        if (times[mode] < times[best])
+            best = mode;
+    }
+
+    /*
+     * Require a 3% end-to-end improvement before AUTO changes away from CPU.
+     * This avoids turning tiny benchmark jitter into a persistent policy.
+     */
+    if (best != 0 && times[best] > times[0] * 0.97)
+        best = 0;
+
+    bool hist_gpu = best == 1 || best == 3;
+    bool pack_gpu = best == 2 || best == 3;
+
+    if (base9_gpu_policy_save(
+            hist_gpu, pack_gpu,
+            times[0], times[1], times[2], times[3]) != 0) {
+        fprintf(stderr, "Calibration succeeded but policy cache write failed.\n");
+        unlink(input_path);
+        unlink(cpu_path);
+        unlink(test_path);
+        return 1;
+    }
+
+    printf("AUTO policy: histograms=%s, radix=%s\n",
+           hist_gpu ? "GPU" : "CPU",
+           pack_gpu ? "GPU" : "CPU");
+    if (best == 0) {
+        printf("Reason: GPU combinations did not beat CPU by at least 3%%.\n");
+    } else {
+        printf("Measured end-to-end gain: %.2f%%\n",
+               (times[0] / times[best] - 1.0) * 100.0);
+    }
+
+    unlink(input_path);
+    unlink(cpu_path);
+    unlink(test_path);
+    return 0;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage:\n  %s encode INPUT [-o OUTPUT] [--block-mib N] [--min-region-kib N] [--threads N]\n  %s decode INPUT [-o OUTPUT] [--threads N]\n  %s gpu-info\n\n"
+        "Usage:\n  %s encode INPUT [-o OUTPUT] [--block-mib N] [--min-region-kib N] [--threads N]\n  %s decode INPUT [-o OUTPUT] [--threads N]\n  %s gpu-info\n  %s gpu-bench\n\n"
         "BASE9 is a bounded-RAM adaptive compressor. It chooses per region among\n"
         "RAW, adaptive-base packing, token-base, static rANS, delta+rANS, and context rANS,\n"
         "and recursively splits large blocks when local statistics compress better.\n"
-        "GPU token discovery uses OpenCL when available and always has CPU fallback.\n", argv0, argv0, argv0);
+        "GPU token discovery uses OpenCL when available and always has CPU fallback.\n", argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -543,6 +840,8 @@ int main(int argc, char **argv) {
         base9_gpu_print_info();
         return base9_gpu.available ? 0 : 1;
     }
+    if (argc >= 2 && strcmp(argv[1], "gpu-bench") == 0)
+        return gpu_bench();
     if (argc < 3) { usage(argv[0]); return 2; }
     bool enc = strcmp(argv[1], "encode") == 0, dec = strcmp(argv[1], "decode") == 0;
     if (!enc && !dec) { usage(argv[0]); return 2; }

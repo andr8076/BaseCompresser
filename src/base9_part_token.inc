@@ -341,14 +341,34 @@ static void token_count_pairs(
            (size_t)TOKEN_SYMBOL_CAP * TOKEN_SYMBOL_CAP * sizeof(*pair_counts));
     if (symbol_count < 2)
         return;
-    for (size_t i = 0; i + 1 < symbol_count; ++i) {
+    /*
+     * token_base_try_encode() rejects regions larger than UINT32_MAX.
+     * Later token streams only get shorter, so a single pair can occur at
+     * most UINT32_MAX-1 times and these uint32_t counters cannot overflow.
+     *
+     * Four-way unrolling exposes independent histogram updates to the CPU,
+     * which benchmarks faster here than AVX2 gather/scatter emulation.
+     */
+    size_t i = 0;
+    for (; i + 4 < symbol_count; i += 4) {
+        unsigned a0 = symbols[i],     b0 = symbols[i + 1];
+        unsigned a1 = symbols[i + 1], b1 = symbols[i + 2];
+        unsigned a2 = symbols[i + 2], b2 = symbols[i + 3];
+        unsigned a3 = symbols[i + 3], b3 = symbols[i + 4];
+
+        if (a0 < TOKEN_SYMBOL_CAP && b0 < TOKEN_SYMBOL_CAP)
+            ++pair_counts[(size_t)a0 * TOKEN_SYMBOL_CAP + b0];
+        if (a1 < TOKEN_SYMBOL_CAP && b1 < TOKEN_SYMBOL_CAP)
+            ++pair_counts[(size_t)a1 * TOKEN_SYMBOL_CAP + b1];
+        if (a2 < TOKEN_SYMBOL_CAP && b2 < TOKEN_SYMBOL_CAP)
+            ++pair_counts[(size_t)a2 * TOKEN_SYMBOL_CAP + b2];
+        if (a3 < TOKEN_SYMBOL_CAP && b3 < TOKEN_SYMBOL_CAP)
+            ++pair_counts[(size_t)a3 * TOKEN_SYMBOL_CAP + b3];
+    }
+    for (; i + 1 < symbol_count; ++i) {
         unsigned a = symbols[i], b = symbols[i + 1];
-        if (a < TOKEN_SYMBOL_CAP && b < TOKEN_SYMBOL_CAP) {
-            uint32_t *slot =
-                &pair_counts[(size_t)a * TOKEN_SYMBOL_CAP + b];
-            if (*slot != UINT32_MAX)
-                ++*slot;
-        }
+        if (a < TOKEN_SYMBOL_CAP && b < TOKEN_SYMBOL_CAP)
+            ++pair_counts[(size_t)a * TOKEN_SYMBOL_CAP + b];
     }
 }
 
@@ -378,13 +398,19 @@ static int token_base_try_encode(
 
     if (base9_gpu_pair_count_u8(
             data, len, pair_counts, TOKEN_SYMBOL_CAP) != 0) {
-        for (size_t i = 0; i + 1 < len; ++i) {
-            unsigned a = data[i], b = data[i + 1];
-            uint32_t *slot =
-                &pair_counts[(size_t)a * TOKEN_SYMBOL_CAP + b];
-            if (*slot != UINT32_MAX)
-                ++*slot;
+        /*
+         * len <= UINT32_MAX, so the same no-overflow proof applies to the
+         * initial byte-pair histogram.
+         */
+        size_t i = 0;
+        for (; i + 4 < len; i += 4) {
+            ++pair_counts[(size_t)data[i]     * TOKEN_SYMBOL_CAP + data[i + 1]];
+            ++pair_counts[(size_t)data[i + 1] * TOKEN_SYMBOL_CAP + data[i + 2]];
+            ++pair_counts[(size_t)data[i + 2] * TOKEN_SYMBOL_CAP + data[i + 3]];
+            ++pair_counts[(size_t)data[i + 3] * TOKEN_SYMBOL_CAP + data[i + 4]];
         }
+        for (; i + 1 < len; ++i)
+            ++pair_counts[(size_t)data[i] * TOKEN_SYMBOL_CAP + data[i + 1]];
     }
 
     if (raw_distinct < 2) {

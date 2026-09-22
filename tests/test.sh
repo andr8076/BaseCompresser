@@ -51,4 +51,9 @@ token_log="$TMP/tokens.log"
 "$BIN" encode "$TMP/tokens" -o "$TMP/tokens.check.base9" --block-mib 4 --min-region-kib 256 --threads 1 >"$token_log"
 grep -Eq 'token-base=[1-9][0-9]*' "$token_log"
 
+# The rolling worker pipeline must never change deterministic output.
+BASECOMPRESSER_PIPELINE_EXTRA=0 "$BIN" encode "$TMP/tokens" -o "$TMP/tokens.pipeline0.base9" --block-mib 1 --min-region-kib 256 --threads 2 >/dev/null
+BASECOMPRESSER_PIPELINE_EXTRA=4 "$BIN" encode "$TMP/tokens" -o "$TMP/tokens.pipeline4.base9" --block-mib 1 --min-region-kib 256 --threads 2 >/dev/null
+cmp "$TMP/tokens.pipeline0.base9" "$TMP/tokens.pipeline4.base9"
+
 echo "BASE9 round-trip tests PASS"

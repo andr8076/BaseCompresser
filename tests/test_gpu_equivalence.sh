@@ -26,19 +26,16 @@ PY
 BASECOMPRESSER_GPU=off "$BIN" encode "$TMP/input" -o "$TMP/cpu.base9" \
     --block-mib 8 --min-region-kib 8192 --threads 1 >/dev/null
 
-BASECOMPRESSER_GPU=force \
-BASECOMPRESSER_GPU_HIST=sharded \
-BASECOMPRESSER_GPU_PACK=force \
-BASECOMPRESSER_GPU_ZERO_COPY=off \
-"$BIN" encode "$TMP/input" -o "$TMP/gpu.base9" \
-    --block-mib 8 --min-region-kib 8192 --threads 1 >"$TMP/gpu.log"
+for async in off on; do
+    env BASECOMPRESSER_GPU=force BASECOMPRESSER_GPU_HIST=sharded BASECOMPRESSER_GPU_PACK=force BASECOMPRESSER_GPU_ZERO_COPY=off BASECOMPRESSER_GPU_ASYNC="$async" "$BIN" encode "$TMP/input" -o "$TMP/gpu-$async.base9" --block-mib 8 --min-region-kib 8192 --threads 2 >"$TMP/gpu-$async.log"
+    cmp "$TMP/cpu.base9" "$TMP/gpu-$async.base9"
+    grep -Eq 'GPU scans:[[:space:]]+[1-9][0-9]* pair histograms' "$TMP/gpu-$async.log"
+    grep -Eq 'GPU radix:[[:space:]]+[1-9][0-9]* higher-base packs' "$TMP/gpu-$async.log"
+done
 
-cmp "$TMP/cpu.base9" "$TMP/gpu.base9"
-grep -Eq 'GPU scans:[[:space:]]+[1-9][0-9]* pair histograms' "$TMP/gpu.log"
-grep -Eq 'GPU radix:[[:space:]]+[1-9][0-9]* higher-base packs' "$TMP/gpu.log"
+cmp "$TMP/gpu-off.base9" "$TMP/gpu-on.base9"
 
-BASECOMPRESSER_GPU=off "$BIN" decode "$TMP/gpu.base9" -o "$TMP/out" \
-    --threads 1 >/dev/null
+BASECOMPRESSER_GPU=off "$BIN" decode "$TMP/gpu-on.base9" -o "$TMP/out" --threads 2 >/dev/null
 cmp "$TMP/input" "$TMP/out"
 
 echo "BASE9 CPU/GPU equivalence PASS"

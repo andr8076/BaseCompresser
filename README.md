@@ -55,7 +55,17 @@ byte-for-byte identical `.base9` files.
 
 ```bash
 ./basecompresser gpu-info
+./basecompresser gpu-bench
 ```
+
+`gpu-bench` runs CPU-only, GPU-histogram-only, GPU-radix-only, and combined
+end-to-end encodes on a deterministic token-heavy corpus. All GPU variants
+must produce byte-for-byte identical BASE9 output before a policy is accepted.
+The fastest combination is cached for the exact OpenCL vendor, device, and
+driver version. AUTO only switches away from CPU when the measured winner is
+at least 3% faster, which avoids persisting benchmark noise. A driver/device
+change invalidates the cached policy automatically. Until a valid calibration
+exists, AUTO stays on CPU rather than guessing that a GPU path will be faster.
 
 Useful controls:
 
@@ -86,12 +96,11 @@ packages into `/usr` or `/etc`:
 ./basecompresser gpu-info
 ```
 
-The Intel HD P530 path was measured directly. Sharded histograms are
-substantially faster than the original GPU global-atomic kernel, and GPU radix
-packing is close to CPU speed, but the complete CPU path remains faster on this
-legacy iGPU. AUTO therefore stays CPU-first on P530; forcing the GPU remains
-available for testing and future kernels. Normal NVIDIA/AMD OpenCL devices use
-the GPU automatically for sufficiently large work.
+The Intel HD P530 path was measured directly. On the validated machine the
+calibrator chose CPU for both pair histograms and radix packing. NVIDIA, AMD,
+modern Intel, and legacy Intel therefore use the same rule now: measured
+end-to-end speed decides AUTO when a valid calibration exists. Explicit
+environment overrides always take precedence over the cached policy.
 
 ## Why BASE9 differs from BASE8
 
@@ -117,11 +126,9 @@ avoiding repeated conversion work.
 ## Next performance/compression work
 
 - token-aware region split costs and content-defined token boundaries
-- batch/pipeline GPU work across independent blocks so transfer and CPU analysis overlap
 - SIMD CPU token scans for systems where GPU offload is not profitable
 - wider token dictionaries and longer super-symbols when they prove profitable
 - SIMD histogram and transform kernels (AVX2 first)
-- persistent worker pool instead of one pthread batch per set of blocks
 - denser rANS model serialization
 - integrate context-cost estimates directly into the adaptive split planner
 - denser/higher-resolution context probability models

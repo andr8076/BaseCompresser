@@ -39,18 +39,25 @@ Useful controls:
 
 If `--threads` is omitted, BASE9 chooses a worker count from CPU availability and available RAM. Memory scales with block size × active workers, not total file size.
 
-## GPU token discovery
+## GPU acceleration
 
-BASE9 can accelerate token pair histograms with OpenCL while keeping token
-selection and adaptive-base packing on the CPU. The same kernel path is used
-for NVIDIA, AMD, and Intel OpenCL devices. GPU support is optional: if no
-usable OpenCL GPU exists, compression automatically keeps using the CPU.
+BASE9 has an optional OpenCL backend shared by NVIDIA, AMD, and Intel GPUs.
+It accelerates two operations that fit the adaptive-base design:
+
+- **Token pair histograms** — the default GPU path uses workgroup-sharded
+  histograms to reduce global atomic contention.
+- **Higher-base radix packing** — once the winning token vocabulary is known,
+  independent radix groups can be packed in parallel on the GPU.
+
+Token selection itself remains deterministic on the CPU, and every GPU path has
+an exact CPU fallback. CPU and GPU encodes are regression-tested to produce
+byte-for-byte identical `.base9` files.
 
 ```bash
 ./basecompresser gpu-info
 ```
 
-Useful environment controls:
+Useful controls:
 
 ```bash
 BASECOMPRESSER_GPU=off ./basecompresser encode input.bin
@@ -58,14 +65,17 @@ BASECOMPRESSER_GPU=force ./basecompresser encode input.bin
 BASECOMPRESSER_GPU_VENDOR=nvidia ./basecompresser encode input.bin
 BASECOMPRESSER_GPU_VENDOR=amd ./basecompresser encode input.bin
 BASECOMPRESSER_GPU_VENDOR=intel ./basecompresser encode input.bin
-BASECOMPRESSER_GPU_MIN_KIB=2048 ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_HIST=sharded ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_HIST=direct ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_HIST=cpu ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_PACK=off ./basecompresser encode input.bin
 ```
 
-AUTO uses GPU pair counting for sufficiently large scans on normal OpenCL
-devices. The validated Skylake/P530 private-compatibility path is intentionally
-CPU-first in AUTO because its current global-atomic histogram kernel measured
-slower than the CPU implementation; `BASECOMPRESSER_GPU=force` still enables
-it for testing or future kernels.
+`sharded` is the normal histogram implementation. `direct` keeps the original
+single global-atomic histogram for comparison, while `tiled` remains an
+experimental local-memory implementation. Large discrete GPUs have their
+default shard count bounded so histogram scratch memory cannot grow without
+limit; advanced testing can override it with `BASECOMPRESSER_GPU_GROUPS`.
 
 For the same Skylake/Gen9 hosts supported by 265Encode's legacy Intel path,
 BaseCompresser can prepare a private OpenCL compute runtime without installing
@@ -76,8 +86,12 @@ packages into `/usr` or `/etc`:
 ./basecompresser gpu-info
 ```
 
-The helper uses the same Intel Gen9/i915 PCI-device detection policy as
-265Encode and stores the extracted runtime under the user's cache directory.
+The Intel HD P530 path was measured directly. Sharded histograms are
+substantially faster than the original GPU global-atomic kernel, and GPU radix
+packing is close to CPU speed, but the complete CPU path remains faster on this
+legacy iGPU. AUTO therefore stays CPU-first on P530; forcing the GPU remains
+available for testing and future kernels. Normal NVIDIA/AMD OpenCL devices use
+the GPU automatically for sufficiently large work.
 
 ## Why BASE9 differs from BASE8
 
@@ -95,12 +109,16 @@ Token-base is the project-specific path: repeated byte sequences become digits.
 The current implementation uses three bounded pair-merge rounds, so useful
 2-byte tokens can recursively become 4-byte and then 8-byte super-symbols.
 Token-base is accepted only when its dictionary plus radix-packed payload beats
-the best competing representation for that region.
+the best competing representation for that region. Candidate merge rounds are
+sized exactly without generating temporary payloads; only the winning round is
+actually radix-packed. This keeps the higher-base method identical while
+avoiding repeated conversion work.
 
 ## Next performance/compression work
 
 - token-aware region split costs and content-defined token boundaries
-- faster token discovery / pair counting (SIMD and persistent scratch buffers)
+- batch/pipeline GPU work across independent blocks so transfer and CPU analysis overlap
+- SIMD CPU token scans for systems where GPU offload is not profitable
 - wider token dictionaries and longer super-symbols when they prove profitable
 - SIMD histogram and transform kernels (AVX2 first)
 - persistent worker pool instead of one pthread batch per set of blocks

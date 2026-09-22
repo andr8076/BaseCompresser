@@ -40,6 +40,7 @@ typedef struct _cl_event *bc_cl_event;
 #define BC_CL_MEM_USE_HOST_PTR (1ULL << 3)
 #define BC_CL_DEVICE_NAME 0x102B
 #define BC_CL_DEVICE_VENDOR 0x102C
+#define BC_CL_DRIVER_VERSION 0x102D
 #define BC_CL_DEVICE_MAX_COMPUTE_UNITS 0x1002
 #define BC_CL_PROGRAM_BUILD_LOG 0x1183
 
@@ -95,6 +96,15 @@ typedef struct {
     bc_cl_uint compute_units;
     char vendor[128];
     char name[256];
+    char driver[128];
+    int policy_loaded;
+    int policy_valid;
+    int policy_hist_gpu;
+    int policy_pack_gpu;
+    double policy_cpu_seconds;
+    double policy_hist_seconds;
+    double policy_pack_seconds;
+    double policy_both_seconds;
     int available;
     int permanently_failed;
     uint64_t successful_jobs;
@@ -219,6 +229,28 @@ static bool base9_gpu_env_force(void) {
                  !strcmp(v, "1") || !strcasecmp(v, "true"));
 }
 
+static bool base9_gpu_env_requests_accel(void) {
+    if (base9_gpu_env_force())
+        return true;
+
+    const char *hist = getenv("BASECOMPRESSER_GPU_HIST");
+    if (hist && *hist &&
+        strcasecmp(hist, "auto") != 0 &&
+        strcasecmp(hist, "cpu") != 0 &&
+        strcasecmp(hist, "off") != 0)
+        return true;
+
+    const char *pack = getenv("BASECOMPRESSER_GPU_PACK");
+    if (pack && *pack &&
+        (!strcasecmp(pack, "force") ||
+         !strcasecmp(pack, "on") ||
+         !strcmp(pack, "1") ||
+         !strcasecmp(pack, "true")))
+        return true;
+
+    return false;
+}
+
 static bool base9_intel_skylake_host(void) {
 #if defined(__linux__) && defined(__x86_64__)
     static const unsigned ids[] = {
@@ -276,6 +308,230 @@ static int base9_gpu_private_paths(char *icd_dir, size_t icd_n, char *lib_dir, s
     return access(icd, R_OK) == 0 && access(lib, R_OK) == 0 ? 0 : -1;
 }
 
+static int base9_gpu_policy_path(
+    char *path,
+    size_t path_n,
+    bool create_dirs
+) {
+    char cache_root[PATH_MAX];
+    const char *xdg = getenv("XDG_CACHE_HOME");
+
+    if (xdg && *xdg) {
+        if (create_dirs && mkdir(xdg, 0700) != 0 && errno != EEXIST)
+            return -1;
+        if (snprintf(
+                cache_root, sizeof(cache_root),
+                "%s/BaseCompresser", xdg) >= (int)sizeof(cache_root))
+            return -1;
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home)
+            return -1;
+
+        char dot_cache[PATH_MAX];
+        if (snprintf(
+                dot_cache, sizeof(dot_cache),
+                "%s/.cache", home) >= (int)sizeof(dot_cache))
+            return -1;
+        if (create_dirs &&
+            mkdir(dot_cache, 0700) != 0 && errno != EEXIST)
+            return -1;
+
+        if (snprintf(
+                cache_root, sizeof(cache_root),
+                "%s/BaseCompresser", dot_cache) >=
+            (int)sizeof(cache_root))
+            return -1;
+    }
+
+    if (create_dirs &&
+        mkdir(cache_root, 0700) != 0 && errno != EEXIST)
+        return -1;
+
+    if (snprintf(
+            path, path_n,
+            "%s/gpu-policy-v1.txt", cache_root) >= (int)path_n)
+        return -1;
+    return 0;
+}
+
+static void base9_gpu_copy_field(
+    char *dst,
+    size_t dst_n,
+    const char *src
+) {
+    if (!dst_n)
+        return;
+    size_t n = strlen(src);
+    if (n >= dst_n)
+        n = dst_n - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static void base9_gpu_strip_line(char *s) {
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r'))
+        s[--n] = '\0';
+}
+
+static int base9_gpu_policy_load_unlocked(void) {
+    if (base9_gpu.policy_loaded)
+        return base9_gpu.policy_valid ? 0 : -1;
+
+    base9_gpu.policy_loaded = 1;
+    base9_gpu.policy_valid = 0;
+
+    char path[PATH_MAX];
+    if (base9_gpu_policy_path(path, sizeof(path), false) != 0)
+        return -1;
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    int version = 0;
+    int hist = -1, pack = -1;
+    char vendor[128] = {0}, name[256] = {0}, driver[128] = {0};
+    double cpu = 0.0, hist_s = 0.0, pack_s = 0.0, both_s = 0.0;
+    char line[512];
+
+    while (fgets(line, sizeof(line), f)) {
+        base9_gpu_strip_line(line);
+        if (strncmp(line, "version=", 8) == 0)
+            version = atoi(line + 8);
+        else if (strncmp(line, "vendor=", 7) == 0)
+            base9_gpu_copy_field(vendor, sizeof(vendor), line + 7);
+        else if (strncmp(line, "name=", 5) == 0)
+            base9_gpu_copy_field(name, sizeof(name), line + 5);
+        else if (strncmp(line, "driver=", 7) == 0)
+            base9_gpu_copy_field(driver, sizeof(driver), line + 7);
+        else if (strncmp(line, "hist_gpu=", 9) == 0)
+            hist = atoi(line + 9);
+        else if (strncmp(line, "pack_gpu=", 9) == 0)
+            pack = atoi(line + 9);
+        else if (strncmp(line, "cpu_seconds=", 12) == 0)
+            cpu = strtod(line + 12, NULL);
+        else if (strncmp(line, "hist_seconds=", 13) == 0)
+            hist_s = strtod(line + 13, NULL);
+        else if (strncmp(line, "pack_seconds=", 13) == 0)
+            pack_s = strtod(line + 13, NULL);
+        else if (strncmp(line, "both_seconds=", 13) == 0)
+            both_s = strtod(line + 13, NULL);
+    }
+    fclose(f);
+
+    if (version != 1 || hist < 0 || pack < 0 ||
+        strcmp(vendor, base9_gpu.vendor) != 0 ||
+        strcmp(name, base9_gpu.name) != 0 ||
+        strcmp(driver, base9_gpu.driver) != 0)
+        return -1;
+
+    base9_gpu.policy_hist_gpu = hist != 0;
+    base9_gpu.policy_pack_gpu = pack != 0;
+    base9_gpu.policy_cpu_seconds = cpu;
+    base9_gpu.policy_hist_seconds = hist_s;
+    base9_gpu.policy_pack_seconds = pack_s;
+    base9_gpu.policy_both_seconds = both_s;
+    base9_gpu.policy_valid = 1;
+    return 0;
+}
+
+static int base9_gpu_policy_load(void) {
+    pthread_mutex_lock(&base9_gpu.lock);
+    int rc = base9_gpu_policy_load_unlocked();
+    pthread_mutex_unlock(&base9_gpu.lock);
+    return rc;
+}
+
+static int base9_gpu_policy_save(
+    bool hist_gpu,
+    bool pack_gpu,
+    double cpu_seconds,
+    double hist_seconds,
+    double pack_seconds,
+    double both_seconds
+) {
+    if (!base9_gpu.available)
+        return -1;
+
+    char path[PATH_MAX];
+    if (base9_gpu_policy_path(path, sizeof(path), true) != 0)
+        return -1;
+
+    char tmp[PATH_MAX];
+    if (snprintf(
+            tmp, sizeof(tmp), "%s.tmp.%ld",
+            path, (long)getpid()) >= (int)sizeof(tmp))
+        return -1;
+
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return -1;
+
+    int ok = fprintf(
+        f,
+        "version=1\n"
+        "vendor=%s\n"
+        "name=%s\n"
+        "driver=%s\n"
+        "hist_gpu=%d\n"
+        "pack_gpu=%d\n"
+        "cpu_seconds=%.9f\n"
+        "hist_seconds=%.9f\n"
+        "pack_seconds=%.9f\n"
+        "both_seconds=%.9f\n",
+        base9_gpu.vendor,
+        base9_gpu.name,
+        base9_gpu.driver,
+        hist_gpu ? 1 : 0,
+        pack_gpu ? 1 : 0,
+        cpu_seconds,
+        hist_seconds,
+        pack_seconds,
+        both_seconds) > 0;
+
+    if (fclose(f) != 0)
+        ok = 0;
+    if (!ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+
+    pthread_mutex_lock(&base9_gpu.lock);
+    base9_gpu.policy_loaded = 1;
+    base9_gpu.policy_valid = 1;
+    base9_gpu.policy_hist_gpu = hist_gpu;
+    base9_gpu.policy_pack_gpu = pack_gpu;
+    base9_gpu.policy_cpu_seconds = cpu_seconds;
+    base9_gpu.policy_hist_seconds = hist_seconds;
+    base9_gpu.policy_pack_seconds = pack_seconds;
+    base9_gpu.policy_both_seconds = both_seconds;
+    pthread_mutex_unlock(&base9_gpu.lock);
+    return 0;
+}
+
+static bool base9_gpu_cached_policy_requests_gpu(void) {
+    char path[PATH_MAX];
+    if (base9_gpu_policy_path(path, sizeof(path), false) != 0)
+        return false;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+
+    bool use_gpu = false;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strcmp(line, "hist_gpu=1\n") == 0 ||
+            strcmp(line, "pack_gpu=1\n") == 0) {
+            use_gpu = true;
+            break;
+        }
+    }
+    fclose(f);
+    return use_gpu;
+}
+
 /*
  * The ICD loader and Intel compiler dependencies read their library paths when
  * the process starts.  Re-exec once with the private cache in the environment,
@@ -284,8 +540,11 @@ static int base9_gpu_private_paths(char *icd_dir, size_t icd_n, char *lib_dir, s
 static void base9_gpu_maybe_reexec_private_intel(int argc, char **argv) {
     if (base9_gpu_env_off()) return;
     if (getenv("BASECOMPRESSER_PRIVATE_OPENCL_ACTIVE")) return;
-    bool info = argc >= 2 && strcmp(argv[1], "gpu-info") == 0;
-    if (!info && !base9_gpu_env_force()) return;
+    bool info = argc >= 2 &&
+        (strcmp(argv[1], "gpu-info") == 0 ||
+         strcmp(argv[1], "gpu-bench") == 0);
+    bool cached_gpu = base9_gpu_cached_policy_requests_gpu();
+    if (!info && !base9_gpu_env_requests_accel() && !cached_gpu) return;
     if (!base9_intel_skylake_host()) return;
 
     /* Prefer any already configured system ICD. */
@@ -394,6 +653,7 @@ static void base9_gpu_init_once(void) {
     bc_cl_device_id chosen = NULL;
     bc_cl_uint chosen_cu = 0;
     char chosen_vendor[128] = {0}, chosen_name[256] = {0};
+    char chosen_driver[128] = {0};
 
     for (bc_cl_uint pi = 0; pi < np; ++pi) {
         bc_cl_uint nd = 0;
@@ -405,10 +665,11 @@ static void base9_gpu_init_once(void) {
             free(devs); continue;
         }
         for (bc_cl_uint di = 0; di < nd; ++di) {
-            char vendor[128] = {0}, name[256] = {0};
+            char vendor[128] = {0}, name[256] = {0}, driver[128] = {0};
             bc_cl_uint cu = 1;
             a->GetDeviceInfo(devs[di], BC_CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
             a->GetDeviceInfo(devs[di], BC_CL_DEVICE_NAME, sizeof(name), name, NULL);
+            a->GetDeviceInfo(devs[di], BC_CL_DRIVER_VERSION, sizeof(driver), driver, NULL);
             a->GetDeviceInfo(devs[di], BC_CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
             if (!base9_gpu_vendor_allowed(vendor)) continue;
             if (!chosen || cu > chosen_cu) {
@@ -416,6 +677,7 @@ static void base9_gpu_init_once(void) {
                 chosen_cu = cu;
                 snprintf(chosen_vendor, sizeof(chosen_vendor), "%s", vendor);
                 snprintf(chosen_name, sizeof(chosen_name), "%s", name);
+                snprintf(chosen_driver, sizeof(chosen_driver), "%s", driver);
             }
         }
         free(devs);
@@ -479,6 +741,7 @@ static void base9_gpu_init_once(void) {
     base9_gpu.compute_units = chosen_cu ? chosen_cu : 1;
     snprintf(base9_gpu.vendor, sizeof(base9_gpu.vendor), "%s", chosen_vendor);
     snprintf(base9_gpu.name, sizeof(base9_gpu.name), "%s", chosen_name);
+    snprintf(base9_gpu.driver, sizeof(base9_gpu.driver), "%s", chosen_driver);
     base9_gpu.available = 1;
     return;
 
@@ -552,15 +815,24 @@ enum Base9GpuHistMode {
 
 static enum Base9GpuHistMode base9_gpu_hist_mode(void) {
     const char *mode = getenv("BASECOMPRESSER_GPU_HIST");
-    if (!mode || !*mode || !strcasecmp(mode, "auto") || !strcasecmp(mode, "sharded"))
+    if (mode && *mode && strcasecmp(mode, "auto") != 0) {
+        if (!strcasecmp(mode, "direct") || !strcasecmp(mode, "global"))
+            return BASE9_GPU_HIST_DIRECT;
+        if (!strcasecmp(mode, "tiled") || !strcasecmp(mode, "local"))
+            return BASE9_GPU_HIST_TILED;
+        if (!strcasecmp(mode, "cpu") || !strcasecmp(mode, "off"))
+            return BASE9_GPU_HIST_CPU;
         return BASE9_GPU_HIST_SHARDED;
-    if (!strcasecmp(mode, "direct") || !strcasecmp(mode, "global"))
-        return BASE9_GPU_HIST_DIRECT;
-    if (!strcasecmp(mode, "tiled") || !strcasecmp(mode, "local"))
-        return BASE9_GPU_HIST_TILED;
-    if (!strcasecmp(mode, "cpu") || !strcasecmp(mode, "off"))
-        return BASE9_GPU_HIST_CPU;
-    return BASE9_GPU_HIST_SHARDED;
+    }
+
+    if (base9_gpu_env_force())
+        return BASE9_GPU_HIST_SHARDED;
+
+    if (base9_gpu_policy_load() == 0)
+        return base9_gpu.policy_hist_gpu ?
+            BASE9_GPU_HIST_SHARDED : BASE9_GPU_HIST_CPU;
+
+    return BASE9_GPU_HIST_CPU;
 }
 
 static size_t base9_gpu_local_size(void) {
@@ -612,12 +884,6 @@ static int base9_gpu_pair_count_common(
         active_rows == 0 || active_rows > pair_cap)
         return 1;
 
-    /* The private P530 path remains opt-in in AUTO until the optimized
-       histogram actually wins there. Forced mode is used by benchmarking and
-       the equivalence test. */
-    if (getenv("BASECOMPRESSER_PRIVATE_OPENCL_ACTIVE") &&
-        !base9_gpu_env_force())
-        return 1;
     if (base9_gpu_init() != 0)
         return 1;
 
@@ -797,7 +1063,7 @@ static int base9_gpu_pair_count_u16(
 
 static bool base9_gpu_pack_enabled(size_t input_bytes) {
     const char *mode = getenv("BASECOMPRESSER_GPU_PACK");
-    if (mode && *mode) {
+    if (mode && *mode && strcasecmp(mode, "auto") != 0) {
         if (!strcasecmp(mode, "off") || !strcasecmp(mode, "no") ||
             !strcmp(mode, "0") || !strcasecmp(mode, "false"))
             return false;
@@ -805,10 +1071,20 @@ static bool base9_gpu_pack_enabled(size_t input_bytes) {
             !strcmp(mode, "1") || !strcasecmp(mode, "true"))
             return true;
     }
+
     if (base9_gpu_env_off())
         return false;
     if (base9_gpu_env_force())
         return true;
+
+    bool allow_gpu;
+    if (base9_gpu_policy_load() == 0)
+        allow_gpu = base9_gpu.policy_pack_gpu != 0;
+    else
+        allow_gpu = false;
+
+    if (!allow_gpu)
+        return false;
 
     size_t min_bytes = 4u * 1024u * 1024u;
     const char *threshold = getenv("BASECOMPRESSER_GPU_PACK_MIN_KIB");
@@ -861,7 +1137,7 @@ static int base9_gpu_pack_radix_u16(
 
     size_t input_bytes = symbol_count * sizeof(*symbols);
     size_t map_bytes = map_len * sizeof(*digit_map);
-    if (!base9_gpu_pack_enabled(input_bytes) || base9_gpu_init() != 0)
+    if (base9_gpu_init() != 0 || !base9_gpu_pack_enabled(input_bytes))
         return 1;
 
     size_t full = symbol_count / gd;
@@ -951,13 +1227,34 @@ static void base9_gpu_report_usage(void) {
 
 static void base9_gpu_print_info(void) {
     if (base9_gpu_init() == 0) {
-        printf("GPU backend: OpenCL\nVendor:      %s\nDevice:      %s\nCompute:     %u units\n",
-               base9_gpu.vendor, base9_gpu.name, base9_gpu.compute_units);
-        if (getenv("BASECOMPRESSER_PRIVATE_OPENCL_ACTIVE")) {
+        printf("GPU backend: OpenCL\n"
+               "Vendor:      %s\n"
+               "Device:      %s\n"
+               "Driver:      %s\n"
+               "Compute:     %u units\n",
+               base9_gpu.vendor, base9_gpu.name, base9_gpu.driver,
+               base9_gpu.compute_units);
+
+        if (getenv("BASECOMPRESSER_PRIVATE_OPENCL_ACTIVE"))
             printf("Runtime:     private Intel Gen9 compatibility runtime\n");
-            printf("Auto policy: CPU on validated P530; BASECOMPRESSER_GPU=force enables sharded histograms + GPU radix packing\n");
+
+        if (base9_gpu_policy_load() == 0) {
+            printf("Calibration: cached for this device + driver\n"
+                   "AUTO hist:   %s\n"
+                   "AUTO radix:  %s\n"
+                   "Bench CPU:   %.3f s\n"
+                   "Bench hist:  %.3f s\n"
+                   "Bench radix: %.3f s\n"
+                   "Bench both:  %.3f s\n",
+                   base9_gpu.policy_hist_gpu ? "GPU" : "CPU",
+                   base9_gpu.policy_pack_gpu ? "GPU" : "CPU",
+                   base9_gpu.policy_cpu_seconds,
+                   base9_gpu.policy_hist_seconds,
+                   base9_gpu.policy_pack_seconds,
+                   base9_gpu.policy_both_seconds);
         } else {
-            printf("Auto policy: sharded GPU histograms for scans >= 1024 KiB; GPU radix packing for symbol streams >= 4096 KiB\n");
+            printf("Calibration: none (AUTO stays CPU until measured)\n"
+                   "Run:         ./basecompresser gpu-bench\n");
         }
     } else {
         printf("GPU backend: unavailable (CPU fallback active)\n");

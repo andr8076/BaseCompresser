@@ -37,6 +37,7 @@ typedef struct _cl_event *bc_cl_event;
 #define BC_CL_DEVICE_TYPE_GPU (1ULL << 2)
 #define BC_CL_MEM_READ_ONLY (1ULL << 2)
 #define BC_CL_MEM_READ_WRITE (1ULL << 0)
+#define BC_CL_MEM_USE_HOST_PTR (1ULL << 3)
 #define BC_CL_DEVICE_NAME 0x102B
 #define BC_CL_DEVICE_VENDOR 0x102C
 #define BC_CL_DEVICE_MAX_COMPUTE_UNITS 0x1002
@@ -74,10 +75,23 @@ typedef struct {
     bc_cl_program program;
     bc_cl_kernel pair_u8;
     bc_cl_kernel pair_u16;
+    bc_cl_kernel pair_u8_sharded;
+    bc_cl_kernel pair_u16_sharded;
+    bc_cl_kernel pair_u8_tiled;
+    bc_cl_kernel pair_u16_tiled;
+    bc_cl_kernel clear_u32;
+    bc_cl_kernel reduce_hist;
+    bc_cl_kernel pack_radix_u16;
     bc_cl_mem input;
     size_t input_cap;
     bc_cl_mem counts;
     size_t counts_cap;
+    bc_cl_mem partial_counts;
+    size_t partial_counts_cap;
+    bc_cl_mem pack_map;
+    size_t pack_map_cap;
+    bc_cl_mem pack_output;
+    size_t pack_output_cap;
     bc_cl_uint compute_units;
     char vendor[128];
     char name[256];
@@ -85,6 +99,8 @@ typedef struct {
     int permanently_failed;
     uint64_t successful_jobs;
     uint64_t successful_input_bytes;
+    uint64_t successful_pack_jobs;
+    uint64_t successful_pack_input_bytes;
     pthread_mutex_t lock;
 } Base9GpuState;
 
@@ -93,7 +109,7 @@ static Base9GpuState base9_gpu = {
 };
 static pthread_once_t base9_gpu_once = PTHREAD_ONCE_INIT;
 
-static const char *base9_opencl_source =
+static const char *base9_opencl_hist_source =
 "__kernel void pair_u8(__global const uchar *in, ulong n, uint cap, __global uint *counts) {\n"
 "  size_t gid=get_global_id(0), stride=get_global_size(0);\n"
 "  for (ulong i=(ulong)gid; i+1<n; i+=(ulong)stride) {\n"
@@ -107,8 +123,90 @@ static const char *base9_opencl_source =
 "    uint a=(uint)in[i], b=(uint)in[i+1];\n"
 "    if (a<cap && b<cap) atomic_inc((volatile __global unsigned int *)&counts[a*cap+b]);\n"
 "  }\n"
+"}\n"
+"__kernel void clear_u32(__global uint *buf, ulong n) {\n"
+"  size_t gid=get_global_id(0), stride=get_global_size(0);\n"
+"  for (ulong i=(ulong)gid; i<n; i+=(ulong)stride) buf[i]=0u;\n"
+"}\n"
+"__kernel void pair_u8_sharded(__global const uchar *in, ulong n, uint cap, uint bins, __global uint *partial) {\n"
+"  size_t gid=get_global_id(0), stride=get_global_size(0);\n"
+"  size_t group=get_group_id(0);\n"
+"  __global uint *row=partial + group*(size_t)bins;\n"
+"  for (ulong i=(ulong)gid; i+1<n; i+=(ulong)stride) {\n"
+"    uint a=(uint)in[i], b=(uint)in[i+1];\n"
+"    atomic_inc((volatile __global unsigned int *)&row[a*cap+b]);\n"
+"  }\n"
+"}\n"
+"__kernel void pair_u16_sharded(__global const ushort *in, ulong n, uint cap, uint bins, __global uint *partial) {\n"
+"  size_t gid=get_global_id(0), stride=get_global_size(0);\n"
+"  size_t group=get_group_id(0);\n"
+"  __global uint *row=partial + group*(size_t)bins;\n"
+"  for (ulong i=(ulong)gid; i+1<n; i+=(ulong)stride) {\n"
+"    uint a=(uint)in[i], b=(uint)in[i+1];\n"
+"    if (a<cap && b<cap) atomic_inc((volatile __global unsigned int *)&row[a*cap+b]);\n"
+"  }\n"
+"}\n"
+"__kernel void reduce_hist(__global const uint *partial, uint bins, uint groups, __global uint *out) {\n"
+"  size_t gid=get_global_id(0), stride=get_global_size(0);\n"
+"  for (size_t bin=gid; bin<(size_t)bins; bin+=stride) {\n"
+"    uint sum=0u;\n"
+"    for (uint g=0; g<groups; ++g) sum += partial[(size_t)g*bins+bin];\n"
+"    out[bin]=sum;\n"
+"  }\n"
+"}\n"
+"#define BC_TILE_ROWS 16u\n"
+"__kernel void pair_u8_tiled(__global const uchar *in, ulong n, uint cap, uint rows, __global uint *out, __local uint *hist) {\n"
+"  uint lid=(uint)get_local_id(0), lsize=(uint)get_local_size(0);\n"
+"  uint tile=(uint)get_group_id(0), row0=tile*BC_TILE_ROWS;\n"
+"  uint local_bins=BC_TILE_ROWS*cap;\n"
+"  for (uint j=lid; j<local_bins; j+=lsize) hist[j]=0u;\n"
+"  barrier(CLK_LOCAL_MEM_FENCE);\n"
+"  for (ulong i=(ulong)lid; i+1<n; i+=(ulong)lsize) {\n"
+"    uint a=(uint)in[i], b=(uint)in[i+1];\n"
+"    if (a>=row0 && a<row0+BC_TILE_ROWS && a<rows)\n"
+"      atomic_inc((volatile __local unsigned int *)&hist[(a-row0)*cap+b]);\n"
+"  }\n"
+"  barrier(CLK_LOCAL_MEM_FENCE);\n"
+"  for (uint j=lid; j<local_bins; j+=lsize) {\n"
+"    uint r=j/cap, c=j-r*cap, global_r=row0+r;\n"
+"    if (global_r<rows) out[global_r*cap+c]=hist[j];\n"
+"  }\n"
+"}\n"
+"__kernel void pair_u16_tiled(__global const ushort *in, ulong n, uint cap, uint rows, __global uint *out, __local uint *hist) {\n"
+"  uint lid=(uint)get_local_id(0), lsize=(uint)get_local_size(0);\n"
+"  uint tile=(uint)get_group_id(0), row0=tile*BC_TILE_ROWS;\n"
+"  uint local_bins=BC_TILE_ROWS*cap;\n"
+"  for (uint j=lid; j<local_bins; j+=lsize) hist[j]=0u;\n"
+"  barrier(CLK_LOCAL_MEM_FENCE);\n"
+"  for (ulong i=(ulong)lid; i+1<n; i+=(ulong)lsize) {\n"
+"    uint a=(uint)in[i], b=(uint)in[i+1];\n"
+"    if (a>=row0 && a<row0+BC_TILE_ROWS && a<rows && b<cap)\n"
+"      atomic_inc((volatile __local unsigned int *)&hist[(a-row0)*cap+b]);\n"
+"  }\n"
+"  barrier(CLK_LOCAL_MEM_FENCE);\n"
+"  for (uint j=lid; j<local_bins; j+=lsize) {\n"
+"    uint r=j/cap, c=j-r*cap, global_r=row0+r;\n"
+"    if (global_r<rows) out[global_r*cap+c]=hist[j];\n"
+"  }\n"
 "}\n";
-
+static const char *base9_opencl_pack_source =
+"__kernel void pack_radix_u16(__global const ushort *symbols, ulong n, __global const ushort *map, uint map_len, uint base, uint gd, uint gb, uint rem_bytes, __global uchar *out) {\n"
+"  ulong group=(ulong)get_global_id(0);\n"
+"  ulong full=n/(ulong)gd, rem=n%(ulong)gd;\n"
+"  ulong groups=full+(rem?1ul:0ul);\n"
+"  if (group>=groups) return;\n"
+"  ulong pos=group*(ulong)gd;\n"
+"  uint take=(group<full)?gd:(uint)rem;\n"
+"  ulong value=0ul;\n"
+"  for (uint j=0; j<take; ++j) {\n"
+"    uint sym=(uint)symbols[pos+j];\n"
+"    if (sym>=map_len) return;\n"
+"    value=value*(ulong)base+(ulong)map[sym];\n"
+"  }\n"
+"  uint bytes=(group<full)?gb:rem_bytes;\n"
+"  ulong off=group*(ulong)gb;\n"
+"  for (uint j=0; j<bytes; ++j) out[off+j]=(uchar)(value>>(8u*j));\n"
+"}\n";
 static bool base9_gpu_env_off(void) {
     const char *v = getenv("BASECOMPRESSER_GPU");
     return v && (!strcasecmp(v, "off") || !strcasecmp(v, "no") ||
@@ -331,9 +429,16 @@ static void base9_gpu_init_once(void) {
     base9_gpu.queue = a->CreateCommandQueue(base9_gpu.context, chosen, 0, &err);
     if (!base9_gpu.queue || err != BC_CL_SUCCESS) goto fail;
 
-    const char *src = base9_opencl_source;
-    size_t src_len = strlen(src);
-    base9_gpu.program = a->CreateProgramWithSource(base9_gpu.context, 1, &src, &src_len, &err);
+    const char *sources[2] = {
+        base9_opencl_hist_source,
+        base9_opencl_pack_source
+    };
+    size_t source_lengths[2] = {
+        strlen(base9_opencl_hist_source),
+        strlen(base9_opencl_pack_source)
+    };
+    base9_gpu.program = a->CreateProgramWithSource(
+        base9_gpu.context, 2, sources, source_lengths, &err);
     if (!base9_gpu.program || err != BC_CL_SUCCESS) goto fail;
     err = a->BuildProgram(base9_gpu.program, 1, &chosen, "-cl-std=CL1.2", NULL, NULL);
     if (err != BC_CL_SUCCESS) {
@@ -354,6 +459,20 @@ static void base9_gpu_init_once(void) {
     if (!base9_gpu.pair_u8 || err != BC_CL_SUCCESS) goto fail;
     base9_gpu.pair_u16 = a->CreateKernel(base9_gpu.program, "pair_u16", &err);
     if (!base9_gpu.pair_u16 || err != BC_CL_SUCCESS) goto fail;
+    base9_gpu.pair_u8_sharded = a->CreateKernel(base9_gpu.program, "pair_u8_sharded", &err);
+    if (!base9_gpu.pair_u8_sharded || err != BC_CL_SUCCESS) goto fail;
+    base9_gpu.pair_u16_sharded = a->CreateKernel(base9_gpu.program, "pair_u16_sharded", &err);
+    if (!base9_gpu.pair_u16_sharded || err != BC_CL_SUCCESS) goto fail;
+    base9_gpu.pair_u8_tiled = a->CreateKernel(base9_gpu.program, "pair_u8_tiled", &err);
+    if (!base9_gpu.pair_u8_tiled || err != BC_CL_SUCCESS) goto fail;
+    base9_gpu.pair_u16_tiled = a->CreateKernel(base9_gpu.program, "pair_u16_tiled", &err);
+    if (!base9_gpu.pair_u16_tiled || err != BC_CL_SUCCESS) goto fail;
+    base9_gpu.clear_u32 = a->CreateKernel(base9_gpu.program, "clear_u32", &err);
+    if (!base9_gpu.clear_u32 || err != BC_CL_SUCCESS) goto fail;
+    base9_gpu.reduce_hist = a->CreateKernel(base9_gpu.program, "reduce_hist", &err);
+    if (!base9_gpu.reduce_hist || err != BC_CL_SUCCESS) goto fail;
+    base9_gpu.pack_radix_u16 = a->CreateKernel(base9_gpu.program, "pack_radix_u16", &err);
+    if (!base9_gpu.pack_radix_u16 || err != BC_CL_SUCCESS) goto fail;
 
     base9_gpu.loader = lib;
     base9_gpu.device = chosen;
@@ -364,6 +483,13 @@ static void base9_gpu_init_once(void) {
     return;
 
 fail:
+    if (base9_gpu.pack_radix_u16 && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pack_radix_u16);
+    if (base9_gpu.reduce_hist && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.reduce_hist);
+    if (base9_gpu.clear_u32 && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.clear_u32);
+    if (base9_gpu.pair_u16_tiled && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u16_tiled);
+    if (base9_gpu.pair_u8_tiled && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u8_tiled);
+    if (base9_gpu.pair_u16_sharded && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u16_sharded);
+    if (base9_gpu.pair_u8_sharded && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u8_sharded);
     if (base9_gpu.pair_u16 && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u16);
     if (base9_gpu.pair_u8 && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u8);
     if (base9_gpu.program && a->ReleaseProgram) a->ReleaseProgram(base9_gpu.program);
@@ -380,7 +506,7 @@ static int base9_gpu_init(void) {
     return base9_gpu.available ? 0 : -1;
 }
 
-static int base9_gpu_ensure_buffers(size_t input_bytes, size_t count_bytes) {
+static int base9_gpu_ensure_buffers(size_t input_bytes, size_t count_bytes, size_t partial_bytes) {
     Base9OpenCLApi *a = &base9_gpu.api;
     bc_cl_int err = 0;
     if (input_bytes > base9_gpu.input_cap) {
@@ -395,7 +521,80 @@ static int base9_gpu_ensure_buffers(size_t input_bytes, size_t count_bytes) {
         if (!base9_gpu.counts || err != BC_CL_SUCCESS) return -1;
         base9_gpu.counts_cap = count_bytes;
     }
+    if (partial_bytes > base9_gpu.partial_counts_cap) {
+        if (base9_gpu.partial_counts) a->ReleaseMemObject(base9_gpu.partial_counts);
+        base9_gpu.partial_counts = a->CreateBuffer(base9_gpu.context, BC_CL_MEM_READ_WRITE, partial_bytes, NULL, &err);
+        if (!base9_gpu.partial_counts || err != BC_CL_SUCCESS) return -1;
+        base9_gpu.partial_counts_cap = partial_bytes;
+    }
     return 0;
+}
+
+static bool base9_gpu_zero_copy_input(void) {
+    const char *mode = getenv("BASECOMPRESSER_GPU_ZERO_COPY");
+    if (mode && *mode) {
+        if (!strcasecmp(mode, "on") || !strcasecmp(mode, "yes") ||
+            !strcmp(mode, "1") || !strcasecmp(mode, "true"))
+            return true;
+        if (!strcasecmp(mode, "off") || !strcasecmp(mode, "no") ||
+            !strcmp(mode, "0") || !strcasecmp(mode, "false"))
+            return false;
+    }
+    return false;
+}
+
+enum Base9GpuHistMode {
+    BASE9_GPU_HIST_DIRECT = 0,
+    BASE9_GPU_HIST_SHARDED = 1,
+    BASE9_GPU_HIST_TILED = 2,
+    BASE9_GPU_HIST_CPU = 3,
+};
+
+static enum Base9GpuHistMode base9_gpu_hist_mode(void) {
+    const char *mode = getenv("BASECOMPRESSER_GPU_HIST");
+    if (!mode || !*mode || !strcasecmp(mode, "auto") || !strcasecmp(mode, "sharded"))
+        return BASE9_GPU_HIST_SHARDED;
+    if (!strcasecmp(mode, "direct") || !strcasecmp(mode, "global"))
+        return BASE9_GPU_HIST_DIRECT;
+    if (!strcasecmp(mode, "tiled") || !strcasecmp(mode, "local"))
+        return BASE9_GPU_HIST_TILED;
+    if (!strcasecmp(mode, "cpu") || !strcasecmp(mode, "off"))
+        return BASE9_GPU_HIST_CPU;
+    return BASE9_GPU_HIST_SHARDED;
+}
+
+static size_t base9_gpu_local_size(void) {
+    size_t local = 128;
+    const char *v = getenv("BASECOMPRESSER_GPU_LOCAL_SIZE");
+    if (v && *v) {
+        unsigned long parsed = strtoul(v, NULL, 10);
+        if (parsed == 32 || parsed == 64 || parsed == 128 || parsed == 256)
+            local = (size_t)parsed;
+    }
+    return local;
+}
+
+static unsigned base9_gpu_shard_groups(void) {
+    const char *absolute = getenv("BASECOMPRESSER_GPU_GROUPS");
+    if (absolute && *absolute) {
+        unsigned long parsed = strtoul(absolute, NULL, 10);
+        if (parsed >= 1 && parsed <= 1024)
+            return (unsigned)parsed;
+    }
+
+    if (getenv("BASECOMPRESSER_PRIVATE_OPENCL_ACTIVE"))
+        return 8;
+
+    unsigned mult = 2;
+    const char *v = getenv("BASECOMPRESSER_GPU_SHARDS_PER_CU");
+    if (v && *v) {
+        unsigned long parsed = strtoul(v, NULL, 10);
+        if (parsed >= 1 && parsed <= 16) mult = (unsigned)parsed;
+    }
+    uint64_t groups = (uint64_t)(base9_gpu.compute_units ? base9_gpu.compute_units : 1) * mult;
+    if (groups < 1) groups = 1;
+    if (groups > 128) groups = 128;
+    return (unsigned)groups;
 }
 
 static int base9_gpu_pair_count_common(
@@ -404,13 +603,18 @@ static int base9_gpu_pair_count_common(
     size_t elem_size,
     uint32_t *counts,
     size_t pair_cap,
-    bc_cl_kernel kernel
+    size_t active_rows,
+    bc_cl_kernel direct_kernel,
+    bc_cl_kernel sharded_kernel,
+    bc_cl_kernel tiled_kernel
 ) {
-    if (n < 2 || !counts || pair_cap == 0 || pair_cap > UINT32_MAX)
+    if (n < 2 || !counts || pair_cap == 0 || pair_cap > UINT32_MAX ||
+        active_rows == 0 || active_rows > pair_cap)
         return 1;
-    /* The Gen9/P530 compatibility path is supported, but its shared-memory
-       global-atomic histogram is slower than the optimized CPU loop on our
-       validated P530 host. Keep it opt-in unless explicitly forced. */
+
+    /* The private P530 path remains opt-in in AUTO until the optimized
+       histogram actually wins there. Forced mode is used by benchmarking and
+       the equivalence test. */
     if (getenv("BASECOMPRESSER_PRIVATE_OPENCL_ACTIVE") &&
         !base9_gpu_env_force())
         return 1;
@@ -429,39 +633,136 @@ static int base9_gpu_pair_count_common(
     if (n > SIZE_MAX / elem_size || pair_cap > SIZE_MAX / pair_cap ||
         pair_cap * pair_cap > SIZE_MAX / sizeof(uint32_t))
         return 1;
+
     size_t input_bytes = n * elem_size;
     size_t count_entries = pair_cap * pair_cap;
     size_t count_bytes = count_entries * sizeof(uint32_t);
+    enum Base9GpuHistMode hist_mode = base9_gpu_hist_mode();
+    if (hist_mode == BASE9_GPU_HIST_CPU)
+        return 1;
+    unsigned groups = hist_mode == BASE9_GPU_HIST_SHARDED ?
+                      base9_gpu_shard_groups() : 0;
+
+    size_t partial_entries = 0, partial_bytes = 0;
+    if (hist_mode == BASE9_GPU_HIST_SHARDED) {
+        if (count_entries > SIZE_MAX / groups)
+            return 1;
+        partial_entries = count_entries * groups;
+        if (partial_entries > SIZE_MAX / sizeof(uint32_t))
+            return 1;
+        partial_bytes = partial_entries * sizeof(uint32_t);
+    }
 
     pthread_mutex_lock(&base9_gpu.lock);
     int rc = 1;
     Base9OpenCLApi *a = &base9_gpu.api;
-    if (base9_gpu_ensure_buffers(input_bytes, count_bytes) != 0)
+    bc_cl_mem host_input = NULL;
+    bool zero_copy = base9_gpu_zero_copy_input();
+    if (base9_gpu_ensure_buffers(zero_copy ? 0 : input_bytes,
+                                 count_bytes, partial_bytes) != 0)
         goto done;
 
-    memset(counts, 0, count_bytes);
-    if (a->EnqueueWriteBuffer(base9_gpu.queue, base9_gpu.input, BC_CL_TRUE, 0, input_bytes, input, 0, NULL, NULL) != BC_CL_SUCCESS ||
-        a->EnqueueWriteBuffer(base9_gpu.queue, base9_gpu.counts, BC_CL_TRUE, 0, count_bytes, counts, 0, NULL, NULL) != BC_CL_SUCCESS)
+    bc_cl_mem input_mem = base9_gpu.input;
+    if (zero_copy) {
+        bc_cl_int create_err = BC_CL_SUCCESS;
+        host_input = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_ONLY | BC_CL_MEM_USE_HOST_PTR,
+            input_bytes, (void *)input, &create_err);
+        if (!host_input || create_err != BC_CL_SUCCESS)
+            goto done;
+        input_mem = host_input;
+    } else if (a->EnqueueWriteBuffer(
+                   base9_gpu.queue, base9_gpu.input, BC_CL_TRUE, 0,
+                   input_bytes, input, 0, NULL, NULL) != BC_CL_SUCCESS) {
         goto done;
+    }
 
-    bc_cl_ulong nn = (bc_cl_ulong)n;
-    bc_cl_uint cap = (bc_cl_uint)pair_cap;
-    if (a->SetKernelArg(kernel, 0, sizeof(base9_gpu.input), &base9_gpu.input) != BC_CL_SUCCESS ||
-        a->SetKernelArg(kernel, 1, sizeof(nn), &nn) != BC_CL_SUCCESS ||
-        a->SetKernelArg(kernel, 2, sizeof(cap), &cap) != BC_CL_SUCCESS ||
-        a->SetKernelArg(kernel, 3, sizeof(base9_gpu.counts), &base9_gpu.counts) != BC_CL_SUCCESS)
-        goto done;
+    size_t local = base9_gpu_local_size();
 
-    size_t local = 128;
-    size_t target = (size_t)base9_gpu.compute_units * 4096u;
-    if (target < local) target = local;
-    size_t useful = n - 1;
-    if (target > useful) target = useful;
-    size_t global = ((target + local - 1) / local) * local;
-    if (global < local) global = local;
+    if (hist_mode == BASE9_GPU_HIST_DIRECT) {
+        memset(counts, 0, count_bytes);
+        if (a->EnqueueWriteBuffer(base9_gpu.queue, base9_gpu.counts, BC_CL_TRUE, 0,
+                                  count_bytes, counts, 0, NULL, NULL) != BC_CL_SUCCESS)
+            goto done;
 
-    if (a->EnqueueNDRangeKernel(base9_gpu.queue, kernel, 1, NULL, &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS ||
-        a->EnqueueReadBuffer(base9_gpu.queue, base9_gpu.counts, BC_CL_TRUE, 0, count_bytes, counts, 0, NULL, NULL) != BC_CL_SUCCESS ||
+        bc_cl_ulong nn = (bc_cl_ulong)n;
+        bc_cl_uint cap = (bc_cl_uint)pair_cap;
+        if (a->SetKernelArg(direct_kernel, 0, sizeof(input_mem), &input_mem) != BC_CL_SUCCESS ||
+            a->SetKernelArg(direct_kernel, 1, sizeof(nn), &nn) != BC_CL_SUCCESS ||
+            a->SetKernelArg(direct_kernel, 2, sizeof(cap), &cap) != BC_CL_SUCCESS ||
+            a->SetKernelArg(direct_kernel, 3, sizeof(base9_gpu.counts), &base9_gpu.counts) != BC_CL_SUCCESS)
+            goto done;
+
+        size_t target = (size_t)base9_gpu.compute_units * 4096u;
+        if (target < local) target = local;
+        size_t useful = n - 1;
+        if (target > useful) target = useful;
+        size_t global = ((target + local - 1) / local) * local;
+        if (global < local) global = local;
+
+        if (a->EnqueueNDRangeKernel(base9_gpu.queue, direct_kernel, 1, NULL,
+                                    &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
+            goto done;
+    } else if (hist_mode == BASE9_GPU_HIST_SHARDED) {
+        bc_cl_ulong clear_n = (bc_cl_ulong)partial_entries;
+        if (a->SetKernelArg(base9_gpu.clear_u32, 0, sizeof(base9_gpu.partial_counts), &base9_gpu.partial_counts) != BC_CL_SUCCESS ||
+            a->SetKernelArg(base9_gpu.clear_u32, 1, sizeof(clear_n), &clear_n) != BC_CL_SUCCESS)
+            goto done;
+        size_t clear_global = (size_t)base9_gpu.compute_units * 1024u;
+        if (clear_global < local) clear_global = local;
+        clear_global = ((clear_global + local - 1) / local) * local;
+        if (a->EnqueueNDRangeKernel(base9_gpu.queue, base9_gpu.clear_u32, 1, NULL,
+                                    &clear_global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
+            goto done;
+
+        bc_cl_ulong nn = (bc_cl_ulong)n;
+        bc_cl_uint cap = (bc_cl_uint)pair_cap;
+        bc_cl_uint bins = (bc_cl_uint)count_entries;
+        if (a->SetKernelArg(sharded_kernel, 0, sizeof(input_mem), &input_mem) != BC_CL_SUCCESS ||
+            a->SetKernelArg(sharded_kernel, 1, sizeof(nn), &nn) != BC_CL_SUCCESS ||
+            a->SetKernelArg(sharded_kernel, 2, sizeof(cap), &cap) != BC_CL_SUCCESS ||
+            a->SetKernelArg(sharded_kernel, 3, sizeof(bins), &bins) != BC_CL_SUCCESS ||
+            a->SetKernelArg(sharded_kernel, 4, sizeof(base9_gpu.partial_counts), &base9_gpu.partial_counts) != BC_CL_SUCCESS)
+            goto done;
+
+        size_t global = (size_t)groups * local;
+        if (a->EnqueueNDRangeKernel(base9_gpu.queue, sharded_kernel, 1, NULL,
+                                    &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
+            goto done;
+
+        bc_cl_uint group_count = groups;
+        if (a->SetKernelArg(base9_gpu.reduce_hist, 0, sizeof(base9_gpu.partial_counts), &base9_gpu.partial_counts) != BC_CL_SUCCESS ||
+            a->SetKernelArg(base9_gpu.reduce_hist, 1, sizeof(bins), &bins) != BC_CL_SUCCESS ||
+            a->SetKernelArg(base9_gpu.reduce_hist, 2, sizeof(group_count), &group_count) != BC_CL_SUCCESS ||
+            a->SetKernelArg(base9_gpu.reduce_hist, 3, sizeof(base9_gpu.counts), &base9_gpu.counts) != BC_CL_SUCCESS)
+            goto done;
+
+        size_t reduce_global = ((count_entries + local - 1) / local) * local;
+        if (a->EnqueueNDRangeKernel(base9_gpu.queue, base9_gpu.reduce_hist, 1, NULL,
+                                    &reduce_global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
+            goto done;
+    } else {
+        bc_cl_ulong nn = (bc_cl_ulong)n;
+        bc_cl_uint cap = (bc_cl_uint)pair_cap;
+        bc_cl_uint rows = (bc_cl_uint)active_rows;
+        size_t local_hist_bytes = 16u * pair_cap * sizeof(uint32_t);
+        if (a->SetKernelArg(tiled_kernel, 0, sizeof(input_mem), &input_mem) != BC_CL_SUCCESS ||
+            a->SetKernelArg(tiled_kernel, 1, sizeof(nn), &nn) != BC_CL_SUCCESS ||
+            a->SetKernelArg(tiled_kernel, 2, sizeof(cap), &cap) != BC_CL_SUCCESS ||
+            a->SetKernelArg(tiled_kernel, 3, sizeof(rows), &rows) != BC_CL_SUCCESS ||
+            a->SetKernelArg(tiled_kernel, 4, sizeof(base9_gpu.counts), &base9_gpu.counts) != BC_CL_SUCCESS ||
+            a->SetKernelArg(tiled_kernel, 5, local_hist_bytes, NULL) != BC_CL_SUCCESS)
+            goto done;
+
+        size_t tiles = (active_rows + 15u) / 16u;
+        size_t global = tiles * local;
+        if (a->EnqueueNDRangeKernel(base9_gpu.queue, tiled_kernel, 1, NULL,
+                                    &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
+            goto done;
+    }
+
+    if (a->EnqueueReadBuffer(base9_gpu.queue, base9_gpu.counts, BC_CL_TRUE, 0,
+                             count_bytes, counts, 0, NULL, NULL) != BC_CL_SUCCESS ||
         a->Finish(base9_gpu.queue) != BC_CL_SUCCESS)
         goto done;
 
@@ -469,6 +770,8 @@ static int base9_gpu_pair_count_common(
     ++base9_gpu.successful_jobs;
     base9_gpu.successful_input_bytes += input_bytes;
 done:
+    if (host_input)
+        a->ReleaseMemObject(host_input);
     pthread_mutex_unlock(&base9_gpu.lock);
     return rc;
 }
@@ -477,8 +780,10 @@ static int base9_gpu_pair_count_u8(
     const uint8_t *input, size_t n, uint32_t *counts, size_t pair_cap
 ) {
     if (base9_gpu_init() != 0) return 1;
+    size_t rows = pair_cap < 256u ? pair_cap : 256u;
     return base9_gpu_pair_count_common(
-        input, n, sizeof(*input), counts, pair_cap, base9_gpu.pair_u8);
+        input, n, sizeof(*input), counts, pair_cap, rows,
+        base9_gpu.pair_u8, base9_gpu.pair_u8_sharded, base9_gpu.pair_u8_tiled);
 }
 
 static int base9_gpu_pair_count_u16(
@@ -486,15 +791,162 @@ static int base9_gpu_pair_count_u16(
 ) {
     if (base9_gpu_init() != 0) return 1;
     return base9_gpu_pair_count_common(
-        input, n, sizeof(*input), counts, pair_cap, base9_gpu.pair_u16);
+        input, n, sizeof(*input), counts, pair_cap, pair_cap,
+        base9_gpu.pair_u16, base9_gpu.pair_u16_sharded, base9_gpu.pair_u16_tiled);
+}
+
+static bool base9_gpu_pack_enabled(size_t input_bytes) {
+    const char *mode = getenv("BASECOMPRESSER_GPU_PACK");
+    if (mode && *mode) {
+        if (!strcasecmp(mode, "off") || !strcasecmp(mode, "no") ||
+            !strcmp(mode, "0") || !strcasecmp(mode, "false"))
+            return false;
+        if (!strcasecmp(mode, "force") || !strcasecmp(mode, "on") ||
+            !strcmp(mode, "1") || !strcasecmp(mode, "true"))
+            return true;
+    }
+    if (base9_gpu_env_off())
+        return false;
+    if (base9_gpu_env_force())
+        return true;
+
+    size_t min_bytes = 4u * 1024u * 1024u;
+    const char *threshold = getenv("BASECOMPRESSER_GPU_PACK_MIN_KIB");
+    if (threshold && *threshold) {
+        unsigned long kib = strtoul(threshold, NULL, 10);
+        if (kib && kib <= SIZE_MAX / 1024u)
+            min_bytes = (size_t)kib * 1024u;
+    }
+    return input_bytes >= min_bytes;
+}
+
+static int base9_gpu_ensure_pack_buffers(size_t map_bytes, size_t output_bytes) {
+    Base9OpenCLApi *a = &base9_gpu.api;
+    bc_cl_int err = BC_CL_SUCCESS;
+    if (map_bytes > base9_gpu.pack_map_cap) {
+        if (base9_gpu.pack_map) a->ReleaseMemObject(base9_gpu.pack_map);
+        base9_gpu.pack_map = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_ONLY, map_bytes, NULL, &err);
+        if (!base9_gpu.pack_map || err != BC_CL_SUCCESS) return -1;
+        base9_gpu.pack_map_cap = map_bytes;
+    }
+    if (output_bytes > base9_gpu.pack_output_cap) {
+        if (base9_gpu.pack_output) a->ReleaseMemObject(base9_gpu.pack_output);
+        base9_gpu.pack_output = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_WRITE, output_bytes, NULL, &err);
+        if (!base9_gpu.pack_output || err != BC_CL_SUCCESS) return -1;
+        base9_gpu.pack_output_cap = output_bytes;
+    }
+    return 0;
+}
+
+static int base9_gpu_pack_radix_u16(
+    const uint16_t *symbols,
+    size_t symbol_count,
+    const uint16_t *digit_map,
+    size_t map_len,
+    unsigned base,
+    unsigned gd,
+    unsigned gb,
+    uint8_t *output,
+    size_t output_bytes
+) {
+    if (!symbols || !digit_map || !output || !symbol_count ||
+        map_len == 0 || map_len > UINT32_MAX ||
+        base <= 1 || gd == 0 || gb == 0 || gb > 8)
+        return 1;
+    if (symbol_count > SIZE_MAX / sizeof(*symbols) ||
+        map_len > SIZE_MAX / sizeof(*digit_map))
+        return 1;
+
+    size_t input_bytes = symbol_count * sizeof(*symbols);
+    size_t map_bytes = map_len * sizeof(*digit_map);
+    if (!base9_gpu_pack_enabled(input_bytes) || base9_gpu_init() != 0)
+        return 1;
+
+    size_t full = symbol_count / gd;
+    unsigned rem = (unsigned)(symbol_count % gd);
+    size_t groups = full + (rem ? 1u : 0u);
+    unsigned rem_bytes = rem ? group_width_bytes(base, rem) : 0u;
+    size_t expected = full * (size_t)gb + rem_bytes;
+    if (expected != output_bytes || !groups)
+        return 1;
+
+    pthread_mutex_lock(&base9_gpu.lock);
+    int rc = 1;
+    Base9OpenCLApi *a = &base9_gpu.api;
+
+    if (base9_gpu_ensure_buffers(input_bytes, 0, 0) != 0 ||
+        base9_gpu_ensure_pack_buffers(map_bytes, output_bytes) != 0)
+        goto done;
+
+    if (a->EnqueueWriteBuffer(
+            base9_gpu.queue, base9_gpu.input, BC_CL_TRUE, 0,
+            input_bytes, symbols, 0, NULL, NULL) != BC_CL_SUCCESS ||
+        a->EnqueueWriteBuffer(
+            base9_gpu.queue, base9_gpu.pack_map, BC_CL_TRUE, 0,
+            map_bytes, digit_map, 0, NULL, NULL) != BC_CL_SUCCESS)
+        goto done;
+
+    bc_cl_ulong nn = (bc_cl_ulong)symbol_count;
+    bc_cl_uint map_n = (bc_cl_uint)map_len;
+    bc_cl_uint b = base, group_digits = gd, group_bytes = gb;
+    bc_cl_uint tail_bytes = rem_bytes;
+
+    if (a->SetKernelArg(base9_gpu.pack_radix_u16, 0,
+                        sizeof(base9_gpu.input), &base9_gpu.input) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 1,
+                        sizeof(nn), &nn) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 2,
+                        sizeof(base9_gpu.pack_map), &base9_gpu.pack_map) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 3,
+                        sizeof(map_n), &map_n) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 4,
+                        sizeof(b), &b) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 5,
+                        sizeof(group_digits), &group_digits) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 6,
+                        sizeof(group_bytes), &group_bytes) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 7,
+                        sizeof(tail_bytes), &tail_bytes) != BC_CL_SUCCESS ||
+        a->SetKernelArg(base9_gpu.pack_radix_u16, 8,
+                        sizeof(base9_gpu.pack_output), &base9_gpu.pack_output) != BC_CL_SUCCESS)
+        goto done;
+
+    size_t local = base9_gpu_local_size();
+    size_t global = ((groups + local - 1) / local) * local;
+    if (a->EnqueueNDRangeKernel(
+            base9_gpu.queue, base9_gpu.pack_radix_u16, 1,
+            NULL, &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS ||
+        a->EnqueueReadBuffer(
+            base9_gpu.queue, base9_gpu.pack_output, BC_CL_TRUE, 0,
+            output_bytes, output, 0, NULL, NULL) != BC_CL_SUCCESS ||
+        a->Finish(base9_gpu.queue) != BC_CL_SUCCESS)
+        goto done;
+
+    rc = 0;
+    ++base9_gpu.successful_pack_jobs;
+    base9_gpu.successful_pack_input_bytes += input_bytes;
+
+done:
+    pthread_mutex_unlock(&base9_gpu.lock);
+    return rc;
 }
 
 static void base9_gpu_report_usage(void) {
-    if (!base9_gpu.available || !base9_gpu.successful_jobs) return;
-    printf("GPU scans:   %" PRIu64 " pair histograms, %.2f MiB via %s %s\n",
-           base9_gpu.successful_jobs,
-           (double)base9_gpu.successful_input_bytes / (1024.0 * 1024.0),
-           base9_gpu.vendor, base9_gpu.name);
+    if (!base9_gpu.available) return;
+    if (base9_gpu.successful_jobs) {
+        printf("GPU scans:   %" PRIu64 " pair histograms, %.2f MiB via %s %s\n",
+               base9_gpu.successful_jobs,
+               (double)base9_gpu.successful_input_bytes / (1024.0 * 1024.0),
+               base9_gpu.vendor, base9_gpu.name);
+    }
+    if (base9_gpu.successful_pack_jobs) {
+        printf("GPU radix:   %" PRIu64 " higher-base packs, %.2f MiB symbols via %s %s\n",
+               base9_gpu.successful_pack_jobs,
+               (double)base9_gpu.successful_pack_input_bytes / (1024.0 * 1024.0),
+               base9_gpu.vendor, base9_gpu.name);
+    }
 }
 
 static void base9_gpu_print_info(void) {
@@ -503,9 +955,9 @@ static void base9_gpu_print_info(void) {
                base9_gpu.vendor, base9_gpu.name, base9_gpu.compute_units);
         if (getenv("BASECOMPRESSER_PRIVATE_OPENCL_ACTIVE")) {
             printf("Runtime:     private Intel Gen9 compatibility runtime\n");
-            printf("Auto policy: CPU pair counting (validated faster on P530); set BASECOMPRESSER_GPU=force to use Intel GPU\n");
+            printf("Auto policy: CPU on validated P530; BASECOMPRESSER_GPU=force enables sharded histograms + GPU radix packing\n");
         } else {
-            printf("Auto policy: GPU pair counting for scans >= 1024 KiB\n");
+            printf("Auto policy: sharded GPU histograms for scans >= 1024 KiB; GPU radix packing for symbol streams >= 4096 KiB\n");
         }
     } else {
         printf("GPU backend: unavailable (CPU fallback active)\n");

@@ -65,52 +65,426 @@ static int write_file_header(FILE *out, uint64_t original_size, uint32_t block_s
     size_t wrote = fwrite(h.data, 1, h.len, out); bv_free(&h); return wrote == FILE_HEADER_SIZE ? 0 : -1;
 }
 
-static int encode_file(const char *src, const char *dst, size_t block_size, size_t min_region, unsigned requested_threads) {
+enum EncodeSlotState {
+    ENCODE_SLOT_EMPTY = 0,
+    ENCODE_SLOT_QUEUED = 1,
+    ENCODE_SLOT_RUNNING = 2,
+    ENCODE_SLOT_DONE = 3,
+};
+
+typedef struct {
+    EncodeJob *jobs;
+    unsigned *states;
+    unsigned *queue;
+    unsigned slot_count;
+    unsigned q_head;
+    unsigned q_tail;
+    unsigned q_count;
+    bool stop;
+    pthread_mutex_t mutex;
+    pthread_cond_t work_cv;
+    pthread_cond_t done_cv;
+} EncodePool;
+
+static void *encode_pool_worker(void *arg) {
+    EncodePool *pool = arg;
+    for (;;) {
+        pthread_mutex_lock(&pool->mutex);
+        while (!pool->stop && pool->q_count == 0)
+            pthread_cond_wait(&pool->work_cv, &pool->mutex);
+        if (pool->stop) {
+            pthread_mutex_unlock(&pool->mutex);
+            return NULL;
+        }
+
+        unsigned slot = pool->queue[pool->q_head];
+        pool->q_head = (pool->q_head + 1u) % pool->slot_count;
+        --pool->q_count;
+        pool->states[slot] = ENCODE_SLOT_RUNNING;
+        pthread_mutex_unlock(&pool->mutex);
+
+        encode_thread(&pool->jobs[slot]);
+
+        pthread_mutex_lock(&pool->mutex);
+        pool->states[slot] = ENCODE_SLOT_DONE;
+        pthread_cond_broadcast(&pool->done_cv);
+        pthread_mutex_unlock(&pool->mutex);
+    }
+}
+
+static int encode_pool_enqueue(EncodePool *pool, unsigned slot) {
+    pthread_mutex_lock(&pool->mutex);
+    if (pool->stop || pool->q_count >= pool->slot_count ||
+        pool->states[slot] != ENCODE_SLOT_EMPTY) {
+        pthread_mutex_unlock(&pool->mutex);
+        return -1;
+    }
+
+    pool->states[slot] = ENCODE_SLOT_QUEUED;
+    pool->queue[pool->q_tail] = slot;
+    pool->q_tail = (pool->q_tail + 1u) % pool->slot_count;
+    ++pool->q_count;
+    pthread_cond_signal(&pool->work_cv);
+    pthread_mutex_unlock(&pool->mutex);
+    return 0;
+}
+
+static int encode_pool_wait_done(EncodePool *pool, unsigned slot) {
+    pthread_mutex_lock(&pool->mutex);
+    while (!pool->stop && pool->states[slot] != ENCODE_SLOT_DONE)
+        pthread_cond_wait(&pool->done_cv, &pool->mutex);
+    int rc = pool->states[slot] == ENCODE_SLOT_DONE ? 0 : -1;
+    pthread_mutex_unlock(&pool->mutex);
+    return rc;
+}
+
+static void encode_pool_mark_empty(EncodePool *pool, unsigned slot) {
+    pthread_mutex_lock(&pool->mutex);
+    pool->states[slot] = ENCODE_SLOT_EMPTY;
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+static void encode_pool_stop(EncodePool *pool) {
+    pthread_mutex_lock(&pool->mutex);
+    pool->stop = true;
+    pthread_cond_broadcast(&pool->work_cv);
+    pthread_cond_broadcast(&pool->done_cv);
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+static int encode_read_job(
+    FILE *in,
+    EncodeJob *job,
+    uint64_t block_index,
+    uint64_t total_size,
+    size_t block_size,
+    size_t min_region
+) {
+    uint64_t off = block_index * (uint64_t)block_size;
+    if (off >= total_size)
+        return -1;
+
+    size_t want = (size_t)((total_size - off) < block_size ?
+                           (total_size - off) : block_size);
+    memset(job, 0, sizeof(*job));
+    job->input = malloc(want ? want : 1);
+    job->input_len = want;
+    job->min_region = min_region;
+
+    if (!job->input)
+        return -1;
+    if (fread(job->input, 1, want, in) != want) {
+        free(job->input);
+        job->input = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static void encode_job_release(EncodeJob *job) {
+    free(job->input);
+    job->input = NULL;
+    bv_free(&job->encoded);
+}
+
+static unsigned encode_pipeline_slots(
+    size_t block_size,
+    unsigned threads,
+    uint64_t blocks
+) {
+    if (!blocks)
+        return 0;
+
+    uint64_t base_slots = threads;
+    if (base_slots > blocks)
+        base_slots = blocks;
+
+    unsigned desired_extra = 4;
+    const char *env = getenv("BASECOMPRESSER_PIPELINE_EXTRA");
+    if (env && *env) {
+        unsigned long parsed = strtoul(env, NULL, 10);
+        if (parsed <= 64)
+            desired_extra = (unsigned)parsed;
+    }
+
+    uint64_t max_extra = blocks > base_slots ? blocks - base_slots : 0;
+    if (desired_extra > max_extra)
+        desired_extra = (unsigned)max_extra;
+    if (!desired_extra)
+        return (unsigned)base_slots;
+
+    /*
+     * Active workers already use the conservative auto_threads() estimate.
+     * A look-ahead slot can simultaneously hold an input and an encoded block,
+     * so budget two block sizes per extra slot.
+     */
+    uint64_t avail = available_memory_bytes();
+    if (!avail && desired_extra > 1)
+        desired_extra = 1;
+    if (avail) {
+        uint64_t budget = avail * 3u / 5u;
+        uint64_t active_per =
+            (uint64_t)block_size * 5u + 32u * 1024u * 1024u;
+        uint64_t extra_per =
+            (uint64_t)block_size * 2u + 1024u * 1024u;
+
+        uint64_t active_need =
+            active_per > UINT64_MAX / threads ?
+            UINT64_MAX : active_per * threads;
+        uint64_t headroom =
+            budget > active_need ? budget - active_need : 0;
+        uint64_t mem_extra = extra_per ? headroom / extra_per : 0;
+        if ((uint64_t)desired_extra > mem_extra)
+            desired_extra = (unsigned)mem_extra;
+    }
+
+    return (unsigned)(base_slots + desired_extra);
+}
+
+static int encode_file(
+    const char *src,
+    const char *dst,
+    size_t block_size,
+    size_t min_region,
+    unsigned requested_threads
+) {
     uint64_t total_size = file_size_of(src);
-    if (total_size == UINT64_MAX) { fprintf(stderr, "Cannot stat input: %s\n", src); return 1; }
-    if (block_size == 0 || block_size > UINT32_MAX || min_region == 0 || min_region > block_size) {
-        fprintf(stderr, "Invalid block/min-region size.\n"); return 1;
+    if (total_size == UINT64_MAX) {
+        fprintf(stderr, "Cannot stat input: %s\n", src);
+        return 1;
     }
-    uint64_t blocks = total_size ? (total_size + block_size - 1) / block_size : 0;
+    if (block_size == 0 || block_size > UINT32_MAX ||
+        min_region == 0 || min_region > block_size) {
+        fprintf(stderr, "Invalid block/min-region size.\n");
+        return 1;
+    }
+
+    uint64_t blocks = total_size ?
+        (total_size + block_size - 1) / block_size : 0;
     unsigned threads = auto_threads(block_size, requested_threads, blocks);
-    FILE *in = fopen(src, "rb"); if (!in) { perror("open input"); return 1; }
-    FILE *out = fopen(dst, "wb"); if (!out) { perror("open output"); fclose(in); return 1; }
-    if (write_file_header(out, total_size, (uint32_t)block_size, (uint32_t)min_region) != 0) { fprintf(stderr, "header write failed\n"); fclose(in); fclose(out); return 1; }
-    printf("BASE9 encode: block=%zu MiB, min-region=%zu KiB, threads=%u\n", block_size >> 20, min_region >> 10, threads);
-    double start = now_seconds(); uint64_t done = 0; uint64_t total_regions = 0; uint64_t methods[METHOD_COUNT] = {0};
-    while (done < total_size) {
-        unsigned batch = threads;
-        uint64_t remain_blocks = (total_size - done + block_size - 1) / block_size;
-        if (batch > remain_blocks) batch = (unsigned)remain_blocks;
-        EncodeJob *jobs = calloc(batch, sizeof(*jobs)); pthread_t *tids = calloc(batch, sizeof(*tids));
-        if (!jobs || !tids) { fprintf(stderr, "out of memory\n"); free(jobs); free(tids); fclose(in); fclose(out); return 1; }
-        unsigned prepared = 0;
-        for (; prepared < batch; ++prepared) {
-            size_t want = (size_t)((total_size - done) < block_size ? (total_size - done) : block_size);
-            jobs[prepared].input = malloc(want ? want : 1); jobs[prepared].input_len = want; jobs[prepared].min_region = min_region;
-            if (!jobs[prepared].input || fread(jobs[prepared].input, 1, want, in) != want) { fprintf(stderr, "input read failed\n"); break; }
-            done += want;
-        }
-        if (prepared != batch) { for (unsigned i=0;i<prepared;++i) free(jobs[i].input); free(jobs); free(tids); fclose(in); fclose(out); return 1; }
-        if (batch == 1) encode_thread(&jobs[0]); else for (unsigned i=0;i<batch;++i) pthread_create(&tids[i], NULL, encode_thread, &jobs[i]);
-        if (batch > 1) for (unsigned i=0;i<batch;++i) pthread_join(tids[i], NULL);
-        for (unsigned i=0;i<batch;++i) {
-            if (jobs[i].error || fwrite(jobs[i].encoded.data, 1, jobs[i].encoded.len, out) != jobs[i].encoded.len) {
-                fprintf(stderr, "encode/write failed: %s\n", jobs[i].error_msg); for (unsigned j=0;j<batch;++j){free(jobs[j].input);bv_free(&jobs[j].encoded);} free(jobs);free(tids);fclose(in);fclose(out);return 1;
-            }
-            total_regions += jobs[i].region_count; for (int m=0;m<METHOD_COUNT;++m) methods[m] += jobs[i].method_counts[m];
-            free(jobs[i].input); bv_free(&jobs[i].encoded);
-        }
-        free(jobs); free(tids);
-        double pct = total_size ? 100.0 * (double)done / (double)total_size : 100.0;
-        printf("\rEncoding: %6.2f%% | regions=%" PRIu64 " | raw=%" PRIu64 " base=%" PRIu64 " rans=%" PRIu64 " delta=%" PRIu64 " ctx=%" PRIu64 " token=%" PRIu64, pct, total_regions, methods[0], methods[1], methods[2], methods[3], methods[4], methods[5]); fflush(stdout);
+
+    FILE *in = fopen(src, "rb");
+    if (!in) {
+        perror("open input");
+        return 1;
     }
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        perror("open output");
+        fclose(in);
+        return 1;
+    }
+    if (write_file_header(
+            out, total_size, (uint32_t)block_size,
+            (uint32_t)min_region) != 0) {
+        fprintf(stderr, "header write failed\n");
+        fclose(in);
+        fclose(out);
+        return 1;
+    }
+
+    printf("BASE9 encode: block=%zu MiB, min-region=%zu KiB, threads=%u\n",
+           block_size >> 20, min_region >> 10, threads);
+
+    if (blocks == 0) {
+        fclose(in);
+        fclose(out);
+        printf("BASE9 encode complete\n"
+               "Input:       0 bytes\n"
+               "Output:      %" PRIu64 " bytes\n"
+               "Regions:     0 (raw=0, base=0, rans=0, delta-rans=0, context-rans=0, token-base=0)\n"
+               "Threads:     %u\n"
+               "Pipeline:    0 slots\n"
+               "Elapsed:     0.000 s\n"
+               "Throughput:  0.00 MiB/s\n"
+               "Created:     %s\n",
+               file_size_of(dst), threads, dst);
+        return 0;
+    }
+
+    /*
+     * A small RAM-aware look-ahead queue keeps workers fed without multiplying
+     * the large per-block working set. Workers persist for the whole file, so
+     * later blocks can run CPU analysis while another block is inside the
+     * serialized GPU queue.
+     */
+    unsigned slot_count =
+        encode_pipeline_slots(block_size, threads, blocks);
+    if (slot_count < 1)
+        slot_count = 1;
+
+    EncodePool pool = {0};
+    pool.slot_count = slot_count;
+    pool.jobs = calloc(slot_count, sizeof(*pool.jobs));
+    pool.states = calloc(slot_count, sizeof(*pool.states));
+    pool.queue = calloc(slot_count, sizeof(*pool.queue));
+    pthread_t *workers = calloc(threads, sizeof(*workers));
+
+    if (!pool.jobs || !pool.states || !pool.queue || !workers) {
+        fprintf(stderr, "out of memory\n");
+        free(pool.jobs);
+        free(pool.states);
+        free(pool.queue);
+        free(workers);
+        fclose(in);
+        fclose(out);
+        return 1;
+    }
+
+    pthread_mutex_init(&pool.mutex, NULL);
+    pthread_cond_init(&pool.work_cv, NULL);
+    pthread_cond_init(&pool.done_cv, NULL);
+
+    unsigned workers_started = 0;
+    for (; workers_started < threads; ++workers_started) {
+        if (pthread_create(
+                &workers[workers_started], NULL,
+                encode_pool_worker, &pool) != 0)
+            break;
+    }
+    if (workers_started != threads) {
+        fprintf(stderr, "failed to start encode worker pool\n");
+        encode_pool_stop(&pool);
+        for (unsigned i = 0; i < workers_started; ++i)
+            pthread_join(workers[i], NULL);
+        pthread_cond_destroy(&pool.done_cv);
+        pthread_cond_destroy(&pool.work_cv);
+        pthread_mutex_destroy(&pool.mutex);
+        free(pool.jobs);
+        free(pool.states);
+        free(pool.queue);
+        free(workers);
+        fclose(in);
+        fclose(out);
+        return 1;
+    }
+
+    double start_time = now_seconds();
+    uint64_t next_read_block = 0;
+    uint64_t next_write_block = 0;
+    uint64_t written_bytes = 0;
+    uint64_t total_regions = 0;
+    uint64_t methods[METHOD_COUNT] = {0};
+    int failed = 0;
+
+    for (; next_read_block < slot_count; ++next_read_block) {
+        unsigned slot = (unsigned)(next_read_block % slot_count);
+        if (encode_read_job(
+                in, &pool.jobs[slot], next_read_block,
+                total_size, block_size, min_region) != 0 ||
+            encode_pool_enqueue(&pool, slot) != 0) {
+            fprintf(stderr, "input read/queue failed\n");
+            failed = 1;
+            break;
+        }
+    }
+
+    while (!failed && next_write_block < blocks) {
+        unsigned slot = (unsigned)(next_write_block % slot_count);
+        if (encode_pool_wait_done(&pool, slot) != 0) {
+            fprintf(stderr, "encode pipeline interrupted\n");
+            failed = 1;
+            break;
+        }
+
+        EncodeJob *job = &pool.jobs[slot];
+        if (job->error ||
+            fwrite(job->encoded.data, 1, job->encoded.len, out) !=
+                job->encoded.len) {
+            fprintf(stderr, "encode/write failed: %s\n", job->error_msg);
+            failed = 1;
+            break;
+        }
+
+        written_bytes += job->input_len;
+        total_regions += job->region_count;
+        for (int m = 0; m < METHOD_COUNT; ++m)
+            methods[m] += job->method_counts[m];
+
+        encode_job_release(job);
+        encode_pool_mark_empty(&pool, slot);
+        ++next_write_block;
+
+        if (next_read_block < blocks) {
+            if (encode_read_job(
+                    in, job, next_read_block,
+                    total_size, block_size, min_region) != 0 ||
+                encode_pool_enqueue(&pool, slot) != 0) {
+                fprintf(stderr, "input read/queue failed\n");
+                failed = 1;
+                break;
+            }
+            ++next_read_block;
+        }
+
+        double pct = total_size ?
+            100.0 * (double)written_bytes / (double)total_size : 100.0;
+        printf("\rEncoding: %6.2f%% | regions=%" PRIu64
+               " | raw=%" PRIu64 " base=%" PRIu64
+               " rans=%" PRIu64 " delta=%" PRIu64
+               " ctx=%" PRIu64 " token=%" PRIu64,
+               pct, total_regions, methods[0], methods[1], methods[2],
+               methods[3], methods[4], methods[5]);
+        fflush(stdout);
+    }
+
+    encode_pool_stop(&pool);
+    for (unsigned i = 0; i < workers_started; ++i)
+        pthread_join(workers[i], NULL);
+
+    for (unsigned i = 0; i < slot_count; ++i)
+        encode_job_release(&pool.jobs[i]);
+
+    pthread_cond_destroy(&pool.done_cv);
+    pthread_cond_destroy(&pool.work_cv);
+    pthread_mutex_destroy(&pool.mutex);
+    free(pool.jobs);
+    free(pool.states);
+    free(pool.queue);
+    free(workers);
+
     printf("\n");
-    if (fclose(in) != 0 || fclose(out) != 0) { perror("close"); return 1; }
-    uint64_t out_size = file_size_of(dst); double elapsed = now_seconds() - start;
-    printf("BASE9 encode complete\nInput:       %" PRIu64 " bytes\nOutput:      %" PRIu64 " bytes\n", total_size, out_size);
-    if (total_size) printf("Ratio:       %.4fx (%.2f%% of original)\n", (double)out_size/total_size, 100.0*(double)out_size/total_size);
-    printf("Regions:     %" PRIu64 " (raw=%" PRIu64 ", base=%" PRIu64 ", rans=%" PRIu64 ", delta-rans=%" PRIu64 ", context-rans=%" PRIu64 ", token-base=%" PRIu64 ")\nThreads:     %u\nElapsed:     %.3f s\nThroughput:  %.2f MiB/s\nCreated:     %s\n", total_regions, methods[0], methods[1], methods[2], methods[3], methods[4], methods[5], threads, elapsed, elapsed>0 ? (double)total_size/(1024.0*1024.0)/elapsed : 0.0, dst);
+
+    int close_error = 0;
+    if (fclose(in) != 0)
+        close_error = 1;
+    if (fclose(out) != 0)
+        close_error = 1;
+
+    if (failed || close_error) {
+        if (close_error)
+            perror("close");
+        return 1;
+    }
+
+    uint64_t out_size = file_size_of(dst);
+    double elapsed = now_seconds() - start_time;
+
+    printf("BASE9 encode complete\n"
+           "Input:       %" PRIu64 " bytes\n"
+           "Output:      %" PRIu64 " bytes\n",
+           total_size, out_size);
+    if (total_size)
+        printf("Ratio:       %.4fx (%.2f%% of original)\n",
+               (double)out_size / total_size,
+               100.0 * (double)out_size / total_size);
+
+    printf("Regions:     %" PRIu64
+           " (raw=%" PRIu64 ", base=%" PRIu64
+           ", rans=%" PRIu64 ", delta-rans=%" PRIu64
+           ", context-rans=%" PRIu64 ", token-base=%" PRIu64 ")\n"
+           "Threads:     %u\n"
+           "Pipeline:    %u slots (persistent workers)\n"
+           "Elapsed:     %.3f s\n"
+           "Throughput:  %.2f MiB/s\n"
+           "Created:     %s\n",
+           total_regions, methods[0], methods[1], methods[2],
+           methods[3], methods[4], methods[5],
+           threads, slot_count, elapsed,
+           elapsed > 0 ?
+               (double)total_size / (1024.0 * 1024.0) / elapsed : 0.0,
+           dst);
+
     base9_gpu_report_usage();
     return 0;
 }

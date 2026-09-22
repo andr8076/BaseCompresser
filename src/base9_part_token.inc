@@ -171,15 +171,23 @@ static unsigned token_choose_merges(
     return chosen;
 }
 
-static int token_pack_stream(
+typedef struct {
+    uint16_t digit_map[TOKEN_SYMBOL_CAP];
+    unsigned base;
+    unsigned gd;
+    unsigned gb;
+    size_t packed_size;
+} TokenRadixLayout;
+
+static int token_prepare_layout(
     const uint16_t *symbols,
     size_t symbol_count,
     const TokenDef defs[TOKEN_MAX_CREATED],
     unsigned created,
     ByteVec *meta,
-    ByteVec *payload
+    TokenRadixLayout *layout
 ) {
-    if (!symbol_count)
+    if (!symbol_count || !layout)
         return -1;
 
     bool used[TOKEN_SYMBOL_CAP] = {0};
@@ -190,15 +198,14 @@ static int token_pack_stream(
     }
 
     uint8_t literal_bitmap[32] = {0};
-    uint16_t digit_map[TOKEN_SYMBOL_CAP];
     for (unsigned i = 0; i < TOKEN_SYMBOL_CAP; ++i)
-        digit_map[i] = UINT16_MAX;
+        layout->digit_map[i] = UINT16_MAX;
 
     unsigned base = 0;
     for (unsigned b = 0; b < 256; ++b) {
         if (!used[b])
             continue;
-        digit_map[b] = (uint16_t)base++;
+        layout->digit_map[b] = (uint16_t)base++;
         literal_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7));
     }
 
@@ -207,7 +214,7 @@ static int token_pack_stream(
         unsigned sym = 256u + t;
         if (!used[sym])
             continue;
-        digit_map[sym] = (uint16_t)base++;
+        layout->digit_map[sym] = (uint16_t)base++;
         ++used_tokens;
     }
 
@@ -215,52 +222,81 @@ static int token_pack_stream(
         return -1;
 
     unsigned gd = 0, gb = 0;
-    (void)base_payload_size(symbol_count, base, &gd, &gb);
+    size_t packed_size =
+        base_payload_size(symbol_count, base, &gd, &gb);
     if (gd > 255u || gb > 255u)
         return -1;
 
-    if (bv_append(meta, literal_bitmap, sizeof(literal_bitmap)) != 0 ||
-        bv_append_u8(meta, (uint8_t)used_tokens) != 0 ||
-        bv_append_u8(meta, (uint8_t)gd) != 0 ||
-        bv_append_u8(meta, (uint8_t)gb) != 0 ||
-        bv_append_u8(meta, 0) != 0 ||
-        bv_append_u32(meta, (uint32_t)symbol_count) != 0)
-        return -1;
+    if (meta) {
+        if (bv_append(meta, literal_bitmap, sizeof(literal_bitmap)) != 0 ||
+            bv_append_u8(meta, (uint8_t)used_tokens) != 0 ||
+            bv_append_u8(meta, (uint8_t)gd) != 0 ||
+            bv_append_u8(meta, (uint8_t)gb) != 0 ||
+            bv_append_u8(meta, 0) != 0 ||
+            bv_append_u32(meta, (uint32_t)symbol_count) != 0)
+            return -1;
 
-    for (unsigned t = 0; t < created; ++t) {
-        if (!used[256u + t])
-            continue;
-        if (defs[t].len < 2 || defs[t].len > TOKEN_MAX_LEN ||
-            bv_append_u8(meta, defs[t].len) != 0 ||
-            bv_append(meta, defs[t].bytes, defs[t].len) != 0)
+        for (unsigned t = 0; t < created; ++t) {
+            if (!used[256u + t])
+                continue;
+            if (defs[t].len < 2 || defs[t].len > TOKEN_MAX_LEN ||
+                bv_append_u8(meta, defs[t].len) != 0 ||
+                bv_append(meta, defs[t].bytes, defs[t].len) != 0)
+                return -1;
+        }
+
+        if (meta->len > UINT16_MAX)
             return -1;
     }
 
-    if (meta->len > UINT16_MAX)
+    layout->base = base;
+    layout->gd = gd;
+    layout->gb = gb;
+    layout->packed_size = packed_size;
+    return 0;
+}
+
+static int token_pack_stream(
+    const uint16_t *symbols,
+    size_t symbol_count,
+    const TokenDef defs[TOKEN_MAX_CREATED],
+    unsigned created,
+    ByteVec *meta,
+    ByteVec *payload
+) {
+    TokenRadixLayout layout;
+    if (token_prepare_layout(
+            symbols, symbol_count, defs, created, meta, &layout) != 0)
         return -1;
 
-    if (base == 1u)
+    if (layout.base == 1u)
         return 0;
 
-    size_t packed_size = base_payload_size(
-        symbol_count, base, NULL, NULL);
     size_t packed_start = payload->len;
-    if (bv_reserve(payload, packed_size) != 0)
+    if (bv_reserve(payload, layout.packed_size) != 0)
         return -1;
-    payload->len += packed_size;
+    payload->len += layout.packed_size;
+
+    if (base9_gpu_pack_radix_u16(
+            symbols, symbol_count, layout.digit_map, TOKEN_SYMBOL_CAP,
+            layout.base, layout.gd, layout.gb,
+            payload->data + packed_start, layout.packed_size) == 0)
+        return 0;
 
     size_t pos = 0, out_pos = packed_start;
     while (pos < symbol_count) {
         unsigned take =
-            (unsigned)((symbol_count - pos) < gd ? (symbol_count - pos) : gd);
+            (unsigned)((symbol_count - pos) < layout.gd ?
+                       (symbol_count - pos) : layout.gd);
         uint64_t value = 0;
         for (unsigned j = 0; j < take; ++j) {
-            uint16_t digit = digit_map[symbols[pos + j]];
-            if (digit == UINT16_MAX || digit >= base)
+            uint16_t digit = layout.digit_map[symbols[pos + j]];
+            if (digit == UINT16_MAX || digit >= layout.base)
                 return -1;
-            value = value * base + digit;
+            value = value * layout.base + digit;
         }
-        unsigned bytes = take == gd ? gb : group_width_bytes(base, take);
+        unsigned bytes = take == layout.gd ?
+                         layout.gb : group_width_bytes(layout.base, take);
         if (bytes > 8 || out_pos + bytes > payload->len)
             return -1;
         for (unsigned j = 0; j < bytes; ++j)
@@ -358,6 +394,9 @@ static int token_base_try_encode(
 
     TokenDef defs[TOKEN_MAX_CREATED] = {{0}};
     TokenMerge choices[TOKEN_MERGES_PER_ROUND] = {{0}};
+    TokenMerge history[TOKEN_ROUNDS][TOKEN_MERGES_PER_ROUND] = {{{0}}};
+    unsigned history_counts[TOKEN_ROUNDS] = {0};
+
     unsigned first_choices = token_choose_merges(
         pair_counts, len, raw_distinct, defs, 0, choices);
     if (!first_choices) {
@@ -383,7 +422,9 @@ static int token_base_try_encode(
     size_t symbol_count = len;
     unsigned created = 0;
     size_t best_total = target_total;
-    bool found_better = false;
+    int best_round = -1;
+    int last_round = -1;
+    unsigned best_created = 0;
 
     for (unsigned round = 0; round < TOKEN_ROUNDS; ++round) {
         unsigned distinct;
@@ -403,6 +444,12 @@ static int token_base_try_encode(
 
         if (!choice_count)
             break;
+
+        if (choice_count > TOKEN_MERGES_PER_ROUND)
+            choice_count = TOKEN_MERGES_PER_ROUND;
+        memcpy(history[round], choices,
+               choice_count * sizeof(history[round][0]));
+        history_counts[round] = choice_count;
 
         memset(pair_map, 0xff, pair_slots * sizeof(*pair_map));
         for (unsigned c = 0; c < choice_count; ++c) {
@@ -430,13 +477,14 @@ static int token_base_try_encode(
             symbols[write++] = symbols[read++];
         }
         symbol_count = write;
+        last_round = (int)round;
 
-        ByteVec candidate_meta = {0}, candidate_payload = {0};
-        if (token_pack_stream(
+        ByteVec estimate_meta = {0};
+        TokenRadixLayout estimate_layout;
+        if (token_prepare_layout(
                 symbols, symbol_count, defs, created,
-                &candidate_meta, &candidate_payload) != 0) {
-            bv_free(&candidate_meta);
-            bv_free(&candidate_payload);
+                &estimate_meta, &estimate_layout) != 0) {
+            bv_free(&estimate_meta);
             free(symbols);
             free(pair_map);
             free(pair_counts);
@@ -444,24 +492,104 @@ static int token_base_try_encode(
         }
 
         size_t total =
-            REGION_HEADER_SIZE + candidate_meta.len + candidate_payload.len;
+            REGION_HEADER_SIZE + estimate_meta.len +
+            estimate_layout.packed_size;
+        bv_free(&estimate_meta);
+
         if (total < best_total) {
-            bv_free(best_meta);
-            bv_free(best_payload);
-            *best_meta = candidate_meta;
-            *best_payload = candidate_payload;
             best_total = total;
-            found_better = true;
-        } else {
-            bv_free(&candidate_meta);
-            bv_free(&candidate_payload);
+            best_round = (int)round;
+            best_created = created;
         }
     }
+
+    if (best_round < 0) {
+        free(symbols);
+        free(pair_map);
+        free(pair_counts);
+        return 1;
+    }
+
+    /*
+     * Usually every profitable merge round improves the radix representation,
+     * so the live symbol stream is already the winning stream. If an earlier
+     * round won, replay only the saved merge decisions; this is still much
+     * cheaper than radix-packing every candidate round.
+     */
+    if (best_round != last_round) {
+        for (size_t i = 0; i < len; ++i)
+            symbols[i] = data[i];
+        symbol_count = len;
+        unsigned replay_created = 0;
+
+        for (int round = 0; round <= best_round; ++round) {
+            memset(pair_map, 0xff, pair_slots * sizeof(*pair_map));
+            for (unsigned c = 0; c < history_counts[round]; ++c) {
+                TokenMerge *merge = &history[round][c];
+                if (replay_created >= TOKEN_MAX_CREATED)
+                    break;
+                pair_map[(size_t)merge->a * TOKEN_SYMBOL_CAP + merge->b] =
+                    (uint16_t)(256u + replay_created);
+                ++replay_created;
+            }
+
+            size_t write = 0;
+            for (size_t read = 0; read < symbol_count;) {
+                if (read + 1 < symbol_count) {
+                    unsigned a = symbols[read], b = symbols[read + 1];
+                    uint16_t merged =
+                        pair_map[(size_t)a * TOKEN_SYMBOL_CAP + b];
+                    if (merged != UINT16_MAX) {
+                        symbols[write++] = merged;
+                        read += 2;
+                        continue;
+                    }
+                }
+                symbols[write++] = symbols[read++];
+            }
+            symbol_count = write;
+        }
+
+        if (replay_created != best_created) {
+            free(symbols);
+            free(pair_map);
+            free(pair_counts);
+            return -1;
+        }
+    }
+
+    ByteVec final_meta = {0}, final_payload = {0};
+    if (token_pack_stream(
+            symbols, symbol_count, defs, best_created,
+            &final_meta, &final_payload) != 0) {
+        bv_free(&final_meta);
+        bv_free(&final_payload);
+        free(symbols);
+        free(pair_map);
+        free(pair_counts);
+        return -1;
+    }
+
+    size_t actual_total =
+        REGION_HEADER_SIZE + final_meta.len + final_payload.len;
+    if (actual_total != best_total) {
+        bv_free(&final_meta);
+        bv_free(&final_payload);
+        free(symbols);
+        free(pair_map);
+        free(pair_counts);
+        return -1;
+    }
+
+    bv_free(best_meta);
+    bv_free(best_payload);
+    *best_meta = final_meta;
+    *best_payload = final_payload;
 
     free(symbols);
     free(pair_map);
     free(pair_counts);
-    return found_better ? 0 : 1;
+    return 0;
 }
 
 static int token_base_decode_region(

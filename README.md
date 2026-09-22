@@ -128,3 +128,21 @@ avoiding repeated conversion work.
 - higher-order and mixed context models
 - content-defined region boundaries rather than boundaries limited to the minimum-region grid
 - benchmark corpus and regression thresholds
+
+### Rolling block pipeline
+
+Encoding uses persistent worker threads instead of stopping at batch boundaries.
+A small look-ahead queue lets CPU analysis of later blocks overlap OpenCL work
+and output handling from earlier blocks while preserving exact block order.
+The default is up to four extra queued slots, automatically reduced when the
+RAM budget cannot safely support them.
+
+For benchmarking, look-ahead can be controlled explicitly:
+
+```bash
+BASECOMPRESSER_PIPELINE_EXTRA=0 ./basecompresser encode input.bin
+BASECOMPRESSER_PIPELINE_EXTRA=4 ./basecompresser encode input.bin
+```
+
+Changing pipeline depth changes scheduling only; regression tests require the
+resulting `.base9` bytes to remain identical.

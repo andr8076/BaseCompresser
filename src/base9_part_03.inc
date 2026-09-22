@@ -614,6 +614,7 @@ static int gpu_bench_child(
     const char *output,
     unsigned threads,
     unsigned mode,
+    unsigned lanes,
     double *elapsed
 ) {
     char threads_s[32];
@@ -627,6 +628,9 @@ static int gpu_bench_child(
     if (pid == 0) {
         setenv("BASECOMPRESSER_PIPELINE_EXTRA", "4", 1);
         setenv("BASECOMPRESSER_GPU_ZERO_COPY", "off", 1);
+        setenv(
+            "BASECOMPRESSER_GPU_ASYNC",
+            lanes >= 2 ? "on" : "off", 1);
 
         if (mode == 0) {
             setenv("BASECOMPRESSER_GPU", "off", 1);
@@ -673,23 +677,11 @@ static int gpu_bench_child(
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
 
-static int gpu_bench_mode(
-    const char *input,
-    const char *output,
-    unsigned threads,
-    unsigned mode,
-    double *average
-) {
-    double sum = 0.0;
-    for (unsigned run = 0; run < 2; ++run) {
-        double elapsed = 0.0;
-        if (gpu_bench_child(
-                input, output, threads, mode, &elapsed) != 0)
-            return -1;
-        sum += elapsed;
-    }
-    *average = sum / 2.0;
-    return 0;
+static double gpu_bench_median3(double a, double b, double c) {
+    if (a > b) { double t = a; a = b; b = t; }
+    if (b > c) { double t = b; b = c; c = t; }
+    if (a > b) { double t = a; a = b; b = t; }
+    return b;
 }
 
 static int gpu_bench(void) {
@@ -741,39 +733,69 @@ static int gpu_bench(void) {
     if (threads < 1)
         threads = 1;
 
-    static const char *names[4] = {
-        "CPU only",
-        "GPU histograms",
-        "GPU radix",
-        "GPU histograms + radix"
+    typedef struct {
+        const char *name;
+        unsigned mode;
+        unsigned lanes;
+    } GpuBenchCase;
+
+    static const GpuBenchCase cases[] = {
+        {"CPU only",                0, 1},
+        {"GPU histograms / 1 lane", 1, 1},
+        {"GPU histograms / 2 lanes",1, 2},
+        {"GPU radix / 1 lane",      2, 1},
+        {"GPU radix / 2 lanes",     2, 2},
+        {"GPU both / 1 lane",       3, 1},
+        {"GPU both / 2 lanes",      3, 2},
     };
-    double times[4] = {0};
+    enum { GPU_BENCH_CASES = sizeof(cases) / sizeof(cases[0]) };
+    double times[GPU_BENCH_CASES] = {0};
+    double samples[GPU_BENCH_CASES][3] = {{0}};
+    static const unsigned order[3][GPU_BENCH_CASES] = {
+        {0, 1, 2, 3, 4, 5, 6},
+        {6, 5, 4, 0, 3, 2, 1},
+        {3, 4, 5, 6, 1, 2, 0},
+    };
 
     printf("Corpus:  64 MiB token-heavy, 8 MiB blocks, %u workers\n",
            threads);
 
     int failed = 0;
-    for (unsigned mode = 0; mode < 4; ++mode) {
-        const char *out = mode == 0 ? cpu_path : test_path;
-        if (gpu_bench_mode(
-                input_path, out, threads, mode, &times[mode]) != 0) {
-            fprintf(stderr, "Calibration mode failed: %s\n", names[mode]);
-            failed = 1;
-            break;
-        }
+    for (unsigned run = 0; run < 3 && !failed; ++run) {
+        for (unsigned pos = 0; pos < GPU_BENCH_CASES; ++pos) {
+            unsigned i = order[run][pos];
+            const char *out = i == 0 ? cpu_path : test_path;
 
-        if (mode != 0 && !gpu_bench_files_equal(cpu_path, test_path)) {
-            fprintf(stderr,
-                    "Calibration aborted: %s produced different BASE9 bytes.\n",
-                    names[mode]);
-            failed = 1;
-            break;
-        }
+            if (gpu_bench_child(
+                    input_path, out, threads,
+                    cases[i].mode, cases[i].lanes,
+                    &samples[i][run]) != 0) {
+                fprintf(stderr,
+                        "Calibration mode failed: %s\n",
+                        cases[i].name);
+                failed = 1;
+                break;
+            }
 
-        printf("%-24s %.3f s  (%.2f MiB/s)\n",
-               names[mode],
-               times[mode],
-               64.0 / times[mode]);
+            if (i != 0 && !gpu_bench_files_equal(cpu_path, test_path)) {
+                fprintf(stderr,
+                        "Calibration aborted: %s produced different BASE9 bytes.\n",
+                        cases[i].name);
+                failed = 1;
+                break;
+            }
+        }
+    }
+
+    if (!failed) {
+        for (unsigned i = 0; i < GPU_BENCH_CASES; ++i) {
+            times[i] = gpu_bench_median3(
+                samples[i][0], samples[i][1], samples[i][2]);
+            printf("%-27s %.3f s  (%.2f MiB/s)\n",
+                   cases[i].name,
+                   times[i],
+                   64.0 / times[i]);
+        }
     }
 
     if (failed) {
@@ -784,36 +806,47 @@ static int gpu_bench(void) {
     }
 
     unsigned best = 0;
-    for (unsigned mode = 1; mode < 4; ++mode) {
-        if (times[mode] < times[best])
-            best = mode;
+    for (unsigned i = 1; i < GPU_BENCH_CASES; ++i) {
+        if (times[i] < times[best])
+            best = i;
     }
 
     /*
-     * Require a 3% end-to-end improvement before AUTO changes away from CPU.
+     * Require a 5% end-to-end improvement before AUTO changes away from CPU.
      * This avoids turning tiny benchmark jitter into a persistent policy.
      */
-    if (best != 0 && times[best] > times[0] * 0.97)
+    if (best != 0 && times[best] > times[0] * 0.95)
         best = 0;
 
-    bool hist_gpu = best == 1 || best == 3;
-    bool pack_gpu = best == 2 || best == 3;
+    unsigned best_mode = cases[best].mode;
+    unsigned best_lanes = best == 0 ? 1 : cases[best].lanes;
+    bool hist_gpu = best_mode == 1 || best_mode == 3;
+    bool pack_gpu = best_mode == 2 || best_mode == 3;
+
+    double hist_seconds =
+        times[1] < times[2] ? times[1] : times[2];
+    double pack_seconds =
+        times[3] < times[4] ? times[3] : times[4];
+    double both_seconds =
+        times[5] < times[6] ? times[5] : times[6];
 
     if (base9_gpu_policy_save(
-            hist_gpu, pack_gpu,
-            times[0], times[1], times[2], times[3]) != 0) {
-        fprintf(stderr, "Calibration succeeded but policy cache write failed.\n");
+            hist_gpu, pack_gpu, best_lanes,
+            times[0], hist_seconds, pack_seconds, both_seconds) != 0) {
+        fprintf(stderr,
+                "Calibration succeeded but policy cache write failed.\n");
         unlink(input_path);
         unlink(cpu_path);
         unlink(test_path);
         return 1;
     }
 
-    printf("AUTO policy: histograms=%s, radix=%s\n",
+    printf("AUTO policy: histograms=%s, radix=%s, lanes=%u\n",
            hist_gpu ? "GPU" : "CPU",
-           pack_gpu ? "GPU" : "CPU");
+           pack_gpu ? "GPU" : "CPU",
+           best_lanes);
     if (best == 0) {
-        printf("Reason: GPU combinations did not beat CPU by at least 3%%.\n");
+        printf("Reason: GPU combinations did not beat CPU by at least 5%%.\n");
     } else {
         printf("Measured end-to-end gain: %.2f%%\n",
                (times[0] / times[best] - 1.0) * 100.0);

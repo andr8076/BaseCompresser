@@ -33,6 +33,7 @@ typedef struct _cl_kernel *bc_cl_kernel;
 typedef struct _cl_event *bc_cl_event;
 
 #define BC_CL_SUCCESS 0
+#define BC_CL_FALSE 0
 #define BC_CL_TRUE 1
 #define BC_CL_DEVICE_TYPE_GPU (1ULL << 2)
 #define BC_CL_MEM_READ_ONLY (1ULL << 2)
@@ -59,7 +60,10 @@ typedef struct {
     bc_cl_int (*EnqueueWriteBuffer)(bc_cl_command_queue, bc_cl_mem, bc_cl_uint, size_t, size_t, const void *, bc_cl_uint, const bc_cl_event *, bc_cl_event *);
     bc_cl_int (*EnqueueNDRangeKernel)(bc_cl_command_queue, bc_cl_kernel, bc_cl_uint, const size_t *, const size_t *, const size_t *, bc_cl_uint, const bc_cl_event *, bc_cl_event *);
     bc_cl_int (*EnqueueReadBuffer)(bc_cl_command_queue, bc_cl_mem, bc_cl_uint, size_t, size_t, void *, bc_cl_uint, const bc_cl_event *, bc_cl_event *);
+    bc_cl_int (*Flush)(bc_cl_command_queue);
     bc_cl_int (*Finish)(bc_cl_command_queue);
+    bc_cl_int (*WaitForEvents)(bc_cl_uint, const bc_cl_event *);
+    bc_cl_int (*ReleaseEvent)(bc_cl_event);
     bc_cl_int (*ReleaseMemObject)(bc_cl_mem);
     bc_cl_int (*ReleaseKernel)(bc_cl_kernel);
     bc_cl_int (*ReleaseProgram)(bc_cl_program);
@@ -67,22 +71,10 @@ typedef struct {
     bc_cl_int (*ReleaseContext)(bc_cl_context);
 } Base9OpenCLApi;
 
+#define BASE9_GPU_LANES 2u
+
 typedef struct {
-    void *loader;
-    Base9OpenCLApi api;
-    bc_cl_device_id device;
-    bc_cl_context context;
     bc_cl_command_queue queue;
-    bc_cl_program program;
-    bc_cl_kernel pair_u8;
-    bc_cl_kernel pair_u16;
-    bc_cl_kernel pair_u8_sharded;
-    bc_cl_kernel pair_u16_sharded;
-    bc_cl_kernel pair_u8_tiled;
-    bc_cl_kernel pair_u16_tiled;
-    bc_cl_kernel clear_u32;
-    bc_cl_kernel reduce_hist;
-    bc_cl_kernel pack_radix_u16;
     bc_cl_mem input;
     size_t input_cap;
     bc_cl_mem counts;
@@ -93,6 +85,26 @@ typedef struct {
     size_t pack_map_cap;
     bc_cl_mem pack_output;
     size_t pack_output_cap;
+    bool busy;
+} Base9GpuLane;
+
+typedef struct {
+    void *loader;
+    Base9OpenCLApi api;
+    bc_cl_device_id device;
+    bc_cl_context context;
+    bc_cl_program program;
+    bc_cl_kernel pair_u8;
+    bc_cl_kernel pair_u16;
+    bc_cl_kernel pair_u8_sharded;
+    bc_cl_kernel pair_u16_sharded;
+    bc_cl_kernel pair_u8_tiled;
+    bc_cl_kernel pair_u16_tiled;
+    bc_cl_kernel clear_u32;
+    bc_cl_kernel reduce_hist;
+    bc_cl_kernel pack_radix_u16;
+
+    Base9GpuLane lanes[BASE9_GPU_LANES];
     bc_cl_uint compute_units;
     char vendor[128];
     char name[256];
@@ -101,6 +113,7 @@ typedef struct {
     int policy_valid;
     int policy_hist_gpu;
     int policy_pack_gpu;
+    int policy_lanes;
     double policy_cpu_seconds;
     double policy_hist_seconds;
     double policy_pack_seconds;
@@ -111,11 +124,14 @@ typedef struct {
     uint64_t successful_input_bytes;
     uint64_t successful_pack_jobs;
     uint64_t successful_pack_input_bytes;
+    uint64_t saturated_cpu_fallbacks;
     pthread_mutex_t lock;
+    pthread_cond_t lane_cv;
 } Base9GpuState;
 
 static Base9GpuState base9_gpu = {
-    .lock = PTHREAD_MUTEX_INITIALIZER
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .lane_cv = PTHREAD_COND_INITIALIZER
 };
 static pthread_once_t base9_gpu_once = PTHREAD_ONCE_INIT;
 
@@ -350,7 +366,7 @@ static int base9_gpu_policy_path(
 
     if (snprintf(
             path, path_n,
-            "%s/gpu-policy-v1.txt", cache_root) >= (int)path_n)
+            "%s/gpu-policy-v2.txt", cache_root) >= (int)path_n)
         return -1;
     return 0;
 }
@@ -391,7 +407,7 @@ static int base9_gpu_policy_load_unlocked(void) {
         return -1;
 
     int version = 0;
-    int hist = -1, pack = -1;
+    int hist = -1, pack = -1, lanes = -1;
     char vendor[128] = {0}, name[256] = {0}, driver[128] = {0};
     double cpu = 0.0, hist_s = 0.0, pack_s = 0.0, both_s = 0.0;
     char line[512];
@@ -410,6 +426,8 @@ static int base9_gpu_policy_load_unlocked(void) {
             hist = atoi(line + 9);
         else if (strncmp(line, "pack_gpu=", 9) == 0)
             pack = atoi(line + 9);
+        else if (strncmp(line, "lanes=", 6) == 0)
+            lanes = atoi(line + 6);
         else if (strncmp(line, "cpu_seconds=", 12) == 0)
             cpu = strtod(line + 12, NULL);
         else if (strncmp(line, "hist_seconds=", 13) == 0)
@@ -421,7 +439,8 @@ static int base9_gpu_policy_load_unlocked(void) {
     }
     fclose(f);
 
-    if (version != 1 || hist < 0 || pack < 0 ||
+    if (version != 2 || hist < 0 || pack < 0 ||
+        lanes < 1 || lanes > (int)BASE9_GPU_LANES ||
         strcmp(vendor, base9_gpu.vendor) != 0 ||
         strcmp(name, base9_gpu.name) != 0 ||
         strcmp(driver, base9_gpu.driver) != 0)
@@ -429,6 +448,7 @@ static int base9_gpu_policy_load_unlocked(void) {
 
     base9_gpu.policy_hist_gpu = hist != 0;
     base9_gpu.policy_pack_gpu = pack != 0;
+    base9_gpu.policy_lanes = lanes;
     base9_gpu.policy_cpu_seconds = cpu;
     base9_gpu.policy_hist_seconds = hist_s;
     base9_gpu.policy_pack_seconds = pack_s;
@@ -447,6 +467,7 @@ static int base9_gpu_policy_load(void) {
 static int base9_gpu_policy_save(
     bool hist_gpu,
     bool pack_gpu,
+    unsigned lanes,
     double cpu_seconds,
     double hist_seconds,
     double pack_seconds,
@@ -471,12 +492,13 @@ static int base9_gpu_policy_save(
 
     int ok = fprintf(
         f,
-        "version=1\n"
+        "version=2\n"
         "vendor=%s\n"
         "name=%s\n"
         "driver=%s\n"
         "hist_gpu=%d\n"
         "pack_gpu=%d\n"
+        "lanes=%u\n"
         "cpu_seconds=%.9f\n"
         "hist_seconds=%.9f\n"
         "pack_seconds=%.9f\n"
@@ -486,6 +508,7 @@ static int base9_gpu_policy_save(
         base9_gpu.driver,
         hist_gpu ? 1 : 0,
         pack_gpu ? 1 : 0,
+        lanes,
         cpu_seconds,
         hist_seconds,
         pack_seconds,
@@ -503,6 +526,7 @@ static int base9_gpu_policy_save(
     base9_gpu.policy_valid = 1;
     base9_gpu.policy_hist_gpu = hist_gpu;
     base9_gpu.policy_pack_gpu = pack_gpu;
+    base9_gpu.policy_lanes = (int)lanes;
     base9_gpu.policy_cpu_seconds = cpu_seconds;
     base9_gpu.policy_hist_seconds = hist_seconds;
     base9_gpu.policy_pack_seconds = pack_seconds;
@@ -633,7 +657,10 @@ static void base9_gpu_init_once(void) {
     BC_LOAD(EnqueueWriteBuffer, "clEnqueueWriteBuffer");
     BC_LOAD(EnqueueNDRangeKernel, "clEnqueueNDRangeKernel");
     BC_LOAD(EnqueueReadBuffer, "clEnqueueReadBuffer");
+    BC_LOAD(Flush, "clFlush");
     BC_LOAD(Finish, "clFinish");
+    BC_LOAD(WaitForEvents, "clWaitForEvents");
+    BC_LOAD(ReleaseEvent, "clReleaseEvent");
     BC_LOAD(ReleaseMemObject, "clReleaseMemObject");
     BC_LOAD(ReleaseKernel, "clReleaseKernel");
     BC_LOAD(ReleaseProgram, "clReleaseProgram");
@@ -688,9 +715,12 @@ static void base9_gpu_init_once(void) {
     bc_cl_int err = 0;
     base9_gpu.context = a->CreateContext(NULL, 1, &chosen, NULL, NULL, &err);
     if (!base9_gpu.context || err != BC_CL_SUCCESS) goto fail;
-    base9_gpu.queue = a->CreateCommandQueue(base9_gpu.context, chosen, 0, &err);
-    if (!base9_gpu.queue || err != BC_CL_SUCCESS) goto fail;
-
+    for (unsigned lane = 0; lane < BASE9_GPU_LANES; ++lane) {
+        base9_gpu.lanes[lane].queue =
+            a->CreateCommandQueue(base9_gpu.context, chosen, 0, &err);
+        if (!base9_gpu.lanes[lane].queue || err != BC_CL_SUCCESS)
+            goto fail;
+    }
     const char *sources[2] = {
         base9_opencl_hist_source,
         base9_opencl_pack_source
@@ -756,7 +786,10 @@ fail:
     if (base9_gpu.pair_u16 && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u16);
     if (base9_gpu.pair_u8 && a->ReleaseKernel) a->ReleaseKernel(base9_gpu.pair_u8);
     if (base9_gpu.program && a->ReleaseProgram) a->ReleaseProgram(base9_gpu.program);
-    if (base9_gpu.queue && a->ReleaseCommandQueue) a->ReleaseCommandQueue(base9_gpu.queue);
+    for (unsigned lane = 0; lane < BASE9_GPU_LANES; ++lane) {
+        if (base9_gpu.lanes[lane].queue && a->ReleaseCommandQueue)
+            a->ReleaseCommandQueue(base9_gpu.lanes[lane].queue);
+    }
     if (base9_gpu.context && a->ReleaseContext) a->ReleaseContext(base9_gpu.context);
     memset(&base9_gpu.api, 0, sizeof(base9_gpu.api));
     dlclose(lib);
@@ -769,26 +802,85 @@ static int base9_gpu_init(void) {
     return base9_gpu.available ? 0 : -1;
 }
 
-static int base9_gpu_ensure_buffers(size_t input_bytes, size_t count_bytes, size_t partial_bytes) {
+static unsigned base9_gpu_lane_limit(void) {
+    const char *mode = getenv("BASECOMPRESSER_GPU_ASYNC");
+    if (mode && *mode) {
+        if (!strcasecmp(mode, "off") || !strcasecmp(mode, "no") ||
+            !strcmp(mode, "0") || !strcasecmp(mode, "false"))
+            return 1;
+        if (!strcasecmp(mode, "on") || !strcasecmp(mode, "yes") ||
+            !strcmp(mode, "1") || !strcasecmp(mode, "true"))
+            return BASE9_GPU_LANES;
+    }
+
+    if (base9_gpu_policy_load() == 0 &&
+        base9_gpu.policy_lanes >= 1 &&
+        base9_gpu.policy_lanes <= (int)BASE9_GPU_LANES)
+        return (unsigned)base9_gpu.policy_lanes;
+
+    return 1;
+}
+
+static int base9_gpu_lane_acquire(bool wait_for_lane) {
+    unsigned limit = base9_gpu_lane_limit();
+    pthread_mutex_lock(&base9_gpu.lock);
+    for (;;) {
+        for (unsigned i = 0; i < limit; ++i) {
+            if (!base9_gpu.lanes[i].busy) {
+                base9_gpu.lanes[i].busy = true;
+                pthread_mutex_unlock(&base9_gpu.lock);
+                return (int)i;
+            }
+        }
+
+        if (!wait_for_lane) {
+            ++base9_gpu.saturated_cpu_fallbacks;
+            pthread_mutex_unlock(&base9_gpu.lock);
+            return -1;
+        }
+
+        pthread_cond_wait(&base9_gpu.lane_cv, &base9_gpu.lock);
+    }
+}
+
+static void base9_gpu_lane_release(unsigned lane_index) {
+    pthread_mutex_lock(&base9_gpu.lock);
+    base9_gpu.lanes[lane_index].busy = false;
+    pthread_cond_signal(&base9_gpu.lane_cv);
+    pthread_mutex_unlock(&base9_gpu.lock);
+}
+
+static int base9_gpu_lane_ensure_buffers(
+    Base9GpuLane *lane,
+    size_t input_bytes,
+    size_t count_bytes,
+    size_t partial_bytes
+) {
     Base9OpenCLApi *a = &base9_gpu.api;
-    bc_cl_int err = 0;
-    if (input_bytes > base9_gpu.input_cap) {
-        if (base9_gpu.input) a->ReleaseMemObject(base9_gpu.input);
-        base9_gpu.input = a->CreateBuffer(base9_gpu.context, BC_CL_MEM_READ_ONLY, input_bytes, NULL, &err);
-        if (!base9_gpu.input || err != BC_CL_SUCCESS) return -1;
-        base9_gpu.input_cap = input_bytes;
+    bc_cl_int err = BC_CL_SUCCESS;
+    if (input_bytes > lane->input_cap) {
+        if (lane->input) a->ReleaseMemObject(lane->input);
+        lane->input = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_ONLY,
+            input_bytes, NULL, &err);
+        if (!lane->input || err != BC_CL_SUCCESS) return -1;
+        lane->input_cap = input_bytes;
     }
-    if (count_bytes > base9_gpu.counts_cap) {
-        if (base9_gpu.counts) a->ReleaseMemObject(base9_gpu.counts);
-        base9_gpu.counts = a->CreateBuffer(base9_gpu.context, BC_CL_MEM_READ_WRITE, count_bytes, NULL, &err);
-        if (!base9_gpu.counts || err != BC_CL_SUCCESS) return -1;
-        base9_gpu.counts_cap = count_bytes;
+    if (count_bytes > lane->counts_cap) {
+        if (lane->counts) a->ReleaseMemObject(lane->counts);
+        lane->counts = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_WRITE,
+            count_bytes, NULL, &err);
+        if (!lane->counts || err != BC_CL_SUCCESS) return -1;
+        lane->counts_cap = count_bytes;
     }
-    if (partial_bytes > base9_gpu.partial_counts_cap) {
-        if (base9_gpu.partial_counts) a->ReleaseMemObject(base9_gpu.partial_counts);
-        base9_gpu.partial_counts = a->CreateBuffer(base9_gpu.context, BC_CL_MEM_READ_WRITE, partial_bytes, NULL, &err);
-        if (!base9_gpu.partial_counts || err != BC_CL_SUCCESS) return -1;
-        base9_gpu.partial_counts_cap = partial_bytes;
+    if (partial_bytes > lane->partial_counts_cap) {
+        if (lane->partial_counts) a->ReleaseMemObject(lane->partial_counts);
+        lane->partial_counts = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_WRITE,
+            partial_bytes, NULL, &err);
+        if (!lane->partial_counts || err != BC_CL_SUCCESS) return -1;
+        lane->partial_counts_cap = partial_bytes;
     }
     return 0;
 }
@@ -919,16 +1011,25 @@ static int base9_gpu_pair_count_common(
         partial_bytes = partial_entries * sizeof(uint32_t);
     }
 
+    int lane_index =
+        base9_gpu_lane_acquire(base9_gpu_env_requests_accel());
+    if (lane_index < 0) return 1;
+    Base9GpuLane *lane = &base9_gpu.lanes[(unsigned)lane_index];
+    bool async = base9_gpu_lane_limit() > 1;
+    bc_cl_uint transfer_blocking = async ? BC_CL_FALSE : BC_CL_TRUE;
+
     pthread_mutex_lock(&base9_gpu.lock);
+    bool locked = true;
     int rc = 1;
     Base9OpenCLApi *a = &base9_gpu.api;
     bc_cl_mem host_input = NULL;
+    bc_cl_event done_event = NULL;
     bool zero_copy = base9_gpu_zero_copy_input();
-    if (base9_gpu_ensure_buffers(zero_copy ? 0 : input_bytes,
+    if (base9_gpu_lane_ensure_buffers(lane, zero_copy ? 0 : input_bytes,
                                  count_bytes, partial_bytes) != 0)
         goto done;
 
-    bc_cl_mem input_mem = base9_gpu.input;
+    bc_cl_mem input_mem = lane->input;
     if (zero_copy) {
         bc_cl_int create_err = BC_CL_SUCCESS;
         host_input = a->CreateBuffer(
@@ -938,7 +1039,7 @@ static int base9_gpu_pair_count_common(
             goto done;
         input_mem = host_input;
     } else if (a->EnqueueWriteBuffer(
-                   base9_gpu.queue, base9_gpu.input, BC_CL_TRUE, 0,
+                   lane->queue, lane->input, transfer_blocking, 0,
                    input_bytes, input, 0, NULL, NULL) != BC_CL_SUCCESS) {
         goto done;
     }
@@ -947,7 +1048,7 @@ static int base9_gpu_pair_count_common(
 
     if (hist_mode == BASE9_GPU_HIST_DIRECT) {
         memset(counts, 0, count_bytes);
-        if (a->EnqueueWriteBuffer(base9_gpu.queue, base9_gpu.counts, BC_CL_TRUE, 0,
+        if (a->EnqueueWriteBuffer(lane->queue, lane->counts, transfer_blocking, 0,
                                   count_bytes, counts, 0, NULL, NULL) != BC_CL_SUCCESS)
             goto done;
 
@@ -956,7 +1057,7 @@ static int base9_gpu_pair_count_common(
         if (a->SetKernelArg(direct_kernel, 0, sizeof(input_mem), &input_mem) != BC_CL_SUCCESS ||
             a->SetKernelArg(direct_kernel, 1, sizeof(nn), &nn) != BC_CL_SUCCESS ||
             a->SetKernelArg(direct_kernel, 2, sizeof(cap), &cap) != BC_CL_SUCCESS ||
-            a->SetKernelArg(direct_kernel, 3, sizeof(base9_gpu.counts), &base9_gpu.counts) != BC_CL_SUCCESS)
+            a->SetKernelArg(direct_kernel, 3, sizeof(lane->counts), &lane->counts) != BC_CL_SUCCESS)
             goto done;
 
         size_t target = (size_t)base9_gpu.compute_units * 4096u;
@@ -966,18 +1067,18 @@ static int base9_gpu_pair_count_common(
         size_t global = ((target + local - 1) / local) * local;
         if (global < local) global = local;
 
-        if (a->EnqueueNDRangeKernel(base9_gpu.queue, direct_kernel, 1, NULL,
+        if (a->EnqueueNDRangeKernel(lane->queue, direct_kernel, 1, NULL,
                                     &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
             goto done;
     } else if (hist_mode == BASE9_GPU_HIST_SHARDED) {
         bc_cl_ulong clear_n = (bc_cl_ulong)partial_entries;
-        if (a->SetKernelArg(base9_gpu.clear_u32, 0, sizeof(base9_gpu.partial_counts), &base9_gpu.partial_counts) != BC_CL_SUCCESS ||
+        if (a->SetKernelArg(base9_gpu.clear_u32, 0, sizeof(lane->partial_counts), &lane->partial_counts) != BC_CL_SUCCESS ||
             a->SetKernelArg(base9_gpu.clear_u32, 1, sizeof(clear_n), &clear_n) != BC_CL_SUCCESS)
             goto done;
         size_t clear_global = (size_t)base9_gpu.compute_units * 1024u;
         if (clear_global < local) clear_global = local;
         clear_global = ((clear_global + local - 1) / local) * local;
-        if (a->EnqueueNDRangeKernel(base9_gpu.queue, base9_gpu.clear_u32, 1, NULL,
+        if (a->EnqueueNDRangeKernel(lane->queue, base9_gpu.clear_u32, 1, NULL,
                                     &clear_global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
             goto done;
 
@@ -988,23 +1089,23 @@ static int base9_gpu_pair_count_common(
             a->SetKernelArg(sharded_kernel, 1, sizeof(nn), &nn) != BC_CL_SUCCESS ||
             a->SetKernelArg(sharded_kernel, 2, sizeof(cap), &cap) != BC_CL_SUCCESS ||
             a->SetKernelArg(sharded_kernel, 3, sizeof(bins), &bins) != BC_CL_SUCCESS ||
-            a->SetKernelArg(sharded_kernel, 4, sizeof(base9_gpu.partial_counts), &base9_gpu.partial_counts) != BC_CL_SUCCESS)
+            a->SetKernelArg(sharded_kernel, 4, sizeof(lane->partial_counts), &lane->partial_counts) != BC_CL_SUCCESS)
             goto done;
 
         size_t global = (size_t)groups * local;
-        if (a->EnqueueNDRangeKernel(base9_gpu.queue, sharded_kernel, 1, NULL,
+        if (a->EnqueueNDRangeKernel(lane->queue, sharded_kernel, 1, NULL,
                                     &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
             goto done;
 
         bc_cl_uint group_count = groups;
-        if (a->SetKernelArg(base9_gpu.reduce_hist, 0, sizeof(base9_gpu.partial_counts), &base9_gpu.partial_counts) != BC_CL_SUCCESS ||
+        if (a->SetKernelArg(base9_gpu.reduce_hist, 0, sizeof(lane->partial_counts), &lane->partial_counts) != BC_CL_SUCCESS ||
             a->SetKernelArg(base9_gpu.reduce_hist, 1, sizeof(bins), &bins) != BC_CL_SUCCESS ||
             a->SetKernelArg(base9_gpu.reduce_hist, 2, sizeof(group_count), &group_count) != BC_CL_SUCCESS ||
-            a->SetKernelArg(base9_gpu.reduce_hist, 3, sizeof(base9_gpu.counts), &base9_gpu.counts) != BC_CL_SUCCESS)
+            a->SetKernelArg(base9_gpu.reduce_hist, 3, sizeof(lane->counts), &lane->counts) != BC_CL_SUCCESS)
             goto done;
 
         size_t reduce_global = ((count_entries + local - 1) / local) * local;
-        if (a->EnqueueNDRangeKernel(base9_gpu.queue, base9_gpu.reduce_hist, 1, NULL,
+        if (a->EnqueueNDRangeKernel(lane->queue, base9_gpu.reduce_hist, 1, NULL,
                                     &reduce_global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
             goto done;
     } else {
@@ -1016,29 +1117,53 @@ static int base9_gpu_pair_count_common(
             a->SetKernelArg(tiled_kernel, 1, sizeof(nn), &nn) != BC_CL_SUCCESS ||
             a->SetKernelArg(tiled_kernel, 2, sizeof(cap), &cap) != BC_CL_SUCCESS ||
             a->SetKernelArg(tiled_kernel, 3, sizeof(rows), &rows) != BC_CL_SUCCESS ||
-            a->SetKernelArg(tiled_kernel, 4, sizeof(base9_gpu.counts), &base9_gpu.counts) != BC_CL_SUCCESS ||
+            a->SetKernelArg(tiled_kernel, 4, sizeof(lane->counts), &lane->counts) != BC_CL_SUCCESS ||
             a->SetKernelArg(tiled_kernel, 5, local_hist_bytes, NULL) != BC_CL_SUCCESS)
             goto done;
 
         size_t tiles = (active_rows + 15u) / 16u;
         size_t global = tiles * local;
-        if (a->EnqueueNDRangeKernel(base9_gpu.queue, tiled_kernel, 1, NULL,
+        if (a->EnqueueNDRangeKernel(lane->queue, tiled_kernel, 1, NULL,
                                     &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
             goto done;
     }
 
-    if (a->EnqueueReadBuffer(base9_gpu.queue, base9_gpu.counts, BC_CL_TRUE, 0,
-                             count_bytes, counts, 0, NULL, NULL) != BC_CL_SUCCESS ||
-        a->Finish(base9_gpu.queue) != BC_CL_SUCCESS)
+    bc_cl_event *read_event = async ? &done_event : NULL;
+    if (a->EnqueueReadBuffer(
+            lane->queue, lane->counts, transfer_blocking, 0,
+            count_bytes, counts, 0, NULL, read_event) != BC_CL_SUCCESS)
         goto done;
 
+    if (async) {
+        if (a->Flush(lane->queue) != BC_CL_SUCCESS)
+            goto done;
+        pthread_mutex_unlock(&base9_gpu.lock);
+        locked = false;
+        if (a->WaitForEvents(1, &done_event) != BC_CL_SUCCESS)
+            goto done;
+
+        pthread_mutex_lock(&base9_gpu.lock);
+        ++base9_gpu.successful_jobs;
+        base9_gpu.successful_input_bytes += input_bytes;
+        pthread_mutex_unlock(&base9_gpu.lock);
+    } else {
+        if (a->Finish(lane->queue) != BC_CL_SUCCESS)
+            goto done;
+        ++base9_gpu.successful_jobs;
+        base9_gpu.successful_input_bytes += input_bytes;
+    }
     rc = 0;
-    ++base9_gpu.successful_jobs;
-    base9_gpu.successful_input_bytes += input_bytes;
+
 done:
+    if (locked)
+        pthread_mutex_unlock(&base9_gpu.lock);
+    if (done_event)
+        a->ReleaseEvent(done_event);
+    if (rc != 0)
+        a->Finish(lane->queue);
     if (host_input)
         a->ReleaseMemObject(host_input);
-    pthread_mutex_unlock(&base9_gpu.lock);
+    base9_gpu_lane_release((unsigned)lane_index);
     return rc;
 }
 
@@ -1096,22 +1221,34 @@ static bool base9_gpu_pack_enabled(size_t input_bytes) {
     return input_bytes >= min_bytes;
 }
 
-static int base9_gpu_ensure_pack_buffers(size_t map_bytes, size_t output_bytes) {
+static int base9_gpu_lane_ensure_pack_buffers(
+    Base9GpuLane *lane,
+    size_t map_bytes,
+    size_t output_bytes
+) {
     Base9OpenCLApi *a = &base9_gpu.api;
     bc_cl_int err = BC_CL_SUCCESS;
-    if (map_bytes > base9_gpu.pack_map_cap) {
-        if (base9_gpu.pack_map) a->ReleaseMemObject(base9_gpu.pack_map);
-        base9_gpu.pack_map = a->CreateBuffer(
-            base9_gpu.context, BC_CL_MEM_READ_ONLY, map_bytes, NULL, &err);
-        if (!base9_gpu.pack_map || err != BC_CL_SUCCESS) return -1;
-        base9_gpu.pack_map_cap = map_bytes;
+
+    if (map_bytes > lane->pack_map_cap) {
+        if (lane->pack_map)
+            a->ReleaseMemObject(lane->pack_map);
+        lane->pack_map = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_ONLY,
+            map_bytes, NULL, &err);
+        if (!lane->pack_map || err != BC_CL_SUCCESS)
+            return -1;
+        lane->pack_map_cap = map_bytes;
     }
-    if (output_bytes > base9_gpu.pack_output_cap) {
-        if (base9_gpu.pack_output) a->ReleaseMemObject(base9_gpu.pack_output);
-        base9_gpu.pack_output = a->CreateBuffer(
-            base9_gpu.context, BC_CL_MEM_READ_WRITE, output_bytes, NULL, &err);
-        if (!base9_gpu.pack_output || err != BC_CL_SUCCESS) return -1;
-        base9_gpu.pack_output_cap = output_bytes;
+
+    if (output_bytes > lane->pack_output_cap) {
+        if (lane->pack_output)
+            a->ReleaseMemObject(lane->pack_output);
+        lane->pack_output = a->CreateBuffer(
+            base9_gpu.context, BC_CL_MEM_READ_WRITE,
+            output_bytes, NULL, &err);
+        if (!lane->pack_output || err != BC_CL_SUCCESS)
+            return -1;
+        lane->pack_output_cap = output_bytes;
     }
     return 0;
 }
@@ -1148,19 +1285,30 @@ static int base9_gpu_pack_radix_u16(
     if (expected != output_bytes || !groups)
         return 1;
 
+    int lane_index =
+        base9_gpu_lane_acquire(base9_gpu_env_requests_accel());
+    if (lane_index < 0)
+        return 1;
+    Base9GpuLane *lane = &base9_gpu.lanes[(unsigned)lane_index];
+    bool async = base9_gpu_lane_limit() > 1;
+    bc_cl_uint transfer_blocking = async ? BC_CL_FALSE : BC_CL_TRUE;
+
     pthread_mutex_lock(&base9_gpu.lock);
+    bool locked = true;
     int rc = 1;
     Base9OpenCLApi *a = &base9_gpu.api;
+    bc_cl_event done_event = NULL;
 
-    if (base9_gpu_ensure_buffers(input_bytes, 0, 0) != 0 ||
-        base9_gpu_ensure_pack_buffers(map_bytes, output_bytes) != 0)
+    if (base9_gpu_lane_ensure_buffers(lane, input_bytes, 0, 0) != 0 ||
+        base9_gpu_lane_ensure_pack_buffers(
+            lane, map_bytes, output_bytes) != 0)
         goto done;
 
     if (a->EnqueueWriteBuffer(
-            base9_gpu.queue, base9_gpu.input, BC_CL_TRUE, 0,
+            lane->queue, lane->input, transfer_blocking, 0,
             input_bytes, symbols, 0, NULL, NULL) != BC_CL_SUCCESS ||
         a->EnqueueWriteBuffer(
-            base9_gpu.queue, base9_gpu.pack_map, BC_CL_TRUE, 0,
+            lane->queue, lane->pack_map, transfer_blocking, 0,
             map_bytes, digit_map, 0, NULL, NULL) != BC_CL_SUCCESS)
         goto done;
 
@@ -1170,11 +1318,11 @@ static int base9_gpu_pack_radix_u16(
     bc_cl_uint tail_bytes = rem_bytes;
 
     if (a->SetKernelArg(base9_gpu.pack_radix_u16, 0,
-                        sizeof(base9_gpu.input), &base9_gpu.input) != BC_CL_SUCCESS ||
+                        sizeof(lane->input), &lane->input) != BC_CL_SUCCESS ||
         a->SetKernelArg(base9_gpu.pack_radix_u16, 1,
                         sizeof(nn), &nn) != BC_CL_SUCCESS ||
         a->SetKernelArg(base9_gpu.pack_radix_u16, 2,
-                        sizeof(base9_gpu.pack_map), &base9_gpu.pack_map) != BC_CL_SUCCESS ||
+                        sizeof(lane->pack_map), &lane->pack_map) != BC_CL_SUCCESS ||
         a->SetKernelArg(base9_gpu.pack_radix_u16, 3,
                         sizeof(map_n), &map_n) != BC_CL_SUCCESS ||
         a->SetKernelArg(base9_gpu.pack_radix_u16, 4,
@@ -1186,26 +1334,50 @@ static int base9_gpu_pack_radix_u16(
         a->SetKernelArg(base9_gpu.pack_radix_u16, 7,
                         sizeof(tail_bytes), &tail_bytes) != BC_CL_SUCCESS ||
         a->SetKernelArg(base9_gpu.pack_radix_u16, 8,
-                        sizeof(base9_gpu.pack_output), &base9_gpu.pack_output) != BC_CL_SUCCESS)
+                        sizeof(lane->pack_output), &lane->pack_output) != BC_CL_SUCCESS)
         goto done;
 
     size_t local = base9_gpu_local_size();
     size_t global = ((groups + local - 1) / local) * local;
     if (a->EnqueueNDRangeKernel(
-            base9_gpu.queue, base9_gpu.pack_radix_u16, 1,
-            NULL, &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS ||
-        a->EnqueueReadBuffer(
-            base9_gpu.queue, base9_gpu.pack_output, BC_CL_TRUE, 0,
-            output_bytes, output, 0, NULL, NULL) != BC_CL_SUCCESS ||
-        a->Finish(base9_gpu.queue) != BC_CL_SUCCESS)
+            lane->queue, base9_gpu.pack_radix_u16, 1,
+            NULL, &global, &local, 0, NULL, NULL) != BC_CL_SUCCESS)
         goto done;
 
+    bc_cl_event *read_event = async ? &done_event : NULL;
+    if (a->EnqueueReadBuffer(
+            lane->queue, lane->pack_output, transfer_blocking, 0,
+            output_bytes, output, 0, NULL, read_event) != BC_CL_SUCCESS)
+        goto done;
+
+    if (async) {
+        if (a->Flush(lane->queue) != BC_CL_SUCCESS)
+            goto done;
+        pthread_mutex_unlock(&base9_gpu.lock);
+        locked = false;
+        if (a->WaitForEvents(1, &done_event) != BC_CL_SUCCESS)
+            goto done;
+
+        pthread_mutex_lock(&base9_gpu.lock);
+        ++base9_gpu.successful_pack_jobs;
+        base9_gpu.successful_pack_input_bytes += input_bytes;
+        pthread_mutex_unlock(&base9_gpu.lock);
+    } else {
+        if (a->Finish(lane->queue) != BC_CL_SUCCESS)
+            goto done;
+        ++base9_gpu.successful_pack_jobs;
+        base9_gpu.successful_pack_input_bytes += input_bytes;
+    }
     rc = 0;
-    ++base9_gpu.successful_pack_jobs;
-    base9_gpu.successful_pack_input_bytes += input_bytes;
 
 done:
-    pthread_mutex_unlock(&base9_gpu.lock);
+    if (locked)
+        pthread_mutex_unlock(&base9_gpu.lock);
+    if (done_event)
+        a->ReleaseEvent(done_event);
+    if (rc != 0)
+        a->Finish(lane->queue);
+    base9_gpu_lane_release((unsigned)lane_index);
     return rc;
 }
 
@@ -1222,6 +1394,10 @@ static void base9_gpu_report_usage(void) {
                base9_gpu.successful_pack_jobs,
                (double)base9_gpu.successful_pack_input_bytes / (1024.0 * 1024.0),
                base9_gpu.vendor, base9_gpu.name);
+    }
+    if (base9_gpu.saturated_cpu_fallbacks) {
+        printf("GPU busy:    %" PRIu64 " operations fell back to CPU instead of waiting\n",
+               base9_gpu.saturated_cpu_fallbacks);
     }
 }
 
@@ -1242,12 +1418,14 @@ static void base9_gpu_print_info(void) {
             printf("Calibration: cached for this device + driver\n"
                    "AUTO hist:   %s\n"
                    "AUTO radix:  %s\n"
+                   "GPU lanes:   %d\n"
                    "Bench CPU:   %.3f s\n"
                    "Bench hist:  %.3f s\n"
                    "Bench radix: %.3f s\n"
                    "Bench both:  %.3f s\n",
                    base9_gpu.policy_hist_gpu ? "GPU" : "CPU",
                    base9_gpu.policy_pack_gpu ? "GPU" : "CPU",
+                   base9_gpu.policy_lanes,
                    base9_gpu.policy_cpu_seconds,
                    base9_gpu.policy_hist_seconds,
                    base9_gpu.policy_pack_seconds,

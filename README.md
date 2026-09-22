@@ -58,14 +58,15 @@ byte-for-byte identical `.base9` files.
 ./basecompresser gpu-bench
 ```
 
-`gpu-bench` runs CPU-only, GPU-histogram-only, GPU-radix-only, and combined
-end-to-end encodes on a deterministic token-heavy corpus. All GPU variants
-must produce byte-for-byte identical BASE9 output before a policy is accepted.
-The fastest combination is cached for the exact OpenCL vendor, device, and
-driver version. AUTO only switches away from CPU when the measured winner is
-at least 3% faster, which avoids persisting benchmark noise. A driver/device
-change invalidates the cached policy automatically. Until a valid calibration
-exists, AUTO stays on CPU rather than guessing that a GPU path will be faster.
+`gpu-bench` measures CPU-only plus histogram, radix, and combined GPU modes
+with both one and two OpenCL lanes. Three rounds rotate the benchmark order so
+CPU/GPU results are not biased by one configuration always running first, and
+the median sample is used. All GPU variants must produce byte-for-byte identical
+BASE9 output before a policy is accepted. The fastest stage/lane combination is
+cached for the exact OpenCL vendor, device, and driver version. AUTO only
+switches away from CPU when the measured winner is at least 5% faster, which
+avoids persisting benchmark noise. A driver/device change invalidates the cache.
+Until a valid calibration exists, AUTO stays on CPU rather than guessing.
 
 Useful controls:
 
@@ -79,6 +80,8 @@ BASECOMPRESSER_GPU_HIST=sharded ./basecompresser encode input.bin
 BASECOMPRESSER_GPU_HIST=direct ./basecompresser encode input.bin
 BASECOMPRESSER_GPU_HIST=cpu ./basecompresser encode input.bin
 BASECOMPRESSER_GPU_PACK=off ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_ASYNC=off ./basecompresser encode input.bin
+BASECOMPRESSER_GPU_ASYNC=on ./basecompresser encode input.bin
 ```
 
 `sharded` is the normal histogram implementation. `direct` keeps the original
@@ -86,6 +89,13 @@ single global-atomic histogram for comparison, while `tiled` remains an
 experimental local-memory implementation. Large discrete GPUs have their
 default shard count bounded so histogram scratch memory cannot grow without
 limit; advanced testing can override it with `BASECOMPRESSER_GPU_GROUPS`.
+
+One GPU lane uses the lower-overhead blocking OpenCL path. Two lanes use
+independent command queues, non-blocking transfers, and completion events so
+work from different blocks can overlap. In calibrated AUTO mode, if every GPU
+lane is busy, the requesting CPU worker immediately uses the exact CPU fallback
+instead of waiting for a GPU lane. Explicit GPU overrides still wait for the
+requested GPU path.
 
 For the same Skylake/Gen9 hosts supported by 265Encode's legacy Intel path,
 BaseCompresser can prepare a private OpenCL compute runtime without installing

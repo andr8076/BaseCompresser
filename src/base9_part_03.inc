@@ -161,7 +161,8 @@ static int encode_read_job(
     uint64_t block_index,
     uint64_t total_size,
     size_t block_size,
-    size_t min_region
+    size_t min_region,
+    enum CompressionLevel level
 ) {
     uint64_t off = block_index * (uint64_t)block_size;
     if (off >= total_size)
@@ -173,6 +174,7 @@ static int encode_read_job(
     job->input = malloc(want ? want : 1);
     job->input_len = want;
     job->min_region = min_region;
+    job->level = level;
 
     if (!job->input)
         return -1;
@@ -249,6 +251,7 @@ static int encode_file(
     const char *dst,
     size_t block_size,
     size_t min_region,
+    enum CompressionLevel level,
     unsigned requested_threads
 ) {
     uint64_t total_size = file_size_of(src);
@@ -259,6 +262,14 @@ static int encode_file(
     if (block_size == 0 || block_size > UINT32_MAX ||
         min_region == 0 || min_region > block_size) {
         fprintf(stderr, "Invalid block/min-region size.\n");
+        return 1;
+    }
+    if (paths_are_same_file(src, dst)) {
+        fprintf(stderr, "Input and output refer to the same file.\n");
+        return 1;
+    }
+    if (pthread_once(&base9_codec_tables_once, base9_codec_tables_init) != 0) {
+        fprintf(stderr, "Failed to initialize codec lookup tables.\n");
         return 1;
     }
 
@@ -286,8 +297,9 @@ static int encode_file(
         return 1;
     }
 
-    printf("BASE9 encode: block=%zu MiB, min-region=%zu KiB, threads=%u\n",
-           block_size >> 20, min_region >> 10, threads);
+    printf("BASE9 encode: block=%zu MiB, min-region=%zu KiB, threads=%u, level=%s\n",
+           block_size >> 20, min_region >> 10, threads,
+           compression_level_name(level));
 
     if (blocks == 0) {
         fclose(in);
@@ -374,7 +386,7 @@ static int encode_file(
         unsigned slot = (unsigned)(next_read_block % slot_count);
         if (encode_read_job(
                 in, &pool.jobs[slot], next_read_block,
-                total_size, block_size, min_region) != 0 ||
+                total_size, block_size, min_region, level) != 0 ||
             encode_pool_enqueue(&pool, slot) != 0) {
             fprintf(stderr, "input read/queue failed\n");
             failed = 1;
@@ -411,7 +423,7 @@ static int encode_file(
         if (next_read_block < blocks) {
             if (encode_read_job(
                     in, job, next_read_block,
-                    total_size, block_size, min_region) != 0 ||
+                    total_size, block_size, min_region, level) != 0 ||
                 encode_pool_enqueue(&pool, slot) != 0) {
                 fprintf(stderr, "input read/queue failed\n");
                 failed = 1;
@@ -494,41 +506,197 @@ static int encode_file(
 
 static int read_exact(FILE *f, void *buf, size_t n) { return fread(buf, 1, n, f) == n ? 0 : -1; }
 
+static void decode_jobs_free(DecodeJob *jobs, unsigned count) {
+    if (!jobs)
+        return;
+    for (unsigned i = 0; i < count; ++i) {
+        free(jobs[i].encoded);
+        bv_free(&jobs[i].decoded);
+    }
+    free(jobs);
+}
+
 static int decode_file(const char *src, const char *dst, unsigned requested_threads) {
-    FILE *in = fopen(src, "rb"); if (!in) { perror("open input"); return 1; }
-    uint8_t h[FILE_HEADER_SIZE]; if (read_exact(in, h, sizeof(h)) != 0 || memcmp(h, FILE_MAGIC, 8) != 0 || rd_u32(h+12) != FILE_HEADER_SIZE) { fprintf(stderr, "Not a supported BASE9 file.\n"); fclose(in); return 1; }
+    FILE *in = fopen(src, "rb");
+    if (!in) { perror("open input"); return 1; }
+    if (paths_are_same_file(src, dst)) {
+        fprintf(stderr, "Input and output refer to the same file.\n");
+        fclose(in);
+        return 1;
+    }
+
+    uint64_t input_size = file_size_of(src);
+    if (input_size == UINT64_MAX || input_size < FILE_HEADER_SIZE) {
+        fprintf(stderr, "Truncated BASE9 file header.\n");
+        fclose(in);
+        return 1;
+    }
+    uint8_t h[FILE_HEADER_SIZE];
+    if (read_exact(in, h, sizeof(h)) != 0 ||
+        memcmp(h, FILE_MAGIC, 8) != 0 || rd_u32(h + 12) != FILE_HEADER_SIZE ||
+        rd_u32(h + 32) != 0 || rd_u32(h + 36) != 0) {
+        fprintf(stderr, "Not a supported BASE9 file.\n");
+        fclose(in);
+        return 1;
+    }
     uint32_t version = rd_u32(h+8);
-    if (version < BASE9_MIN_VERSION || version > BASE9_VERSION) { fprintf(stderr, "Unsupported BASE9 version: %u\n", version); fclose(in); return 1; }
-    uint64_t original_size = rd_u64(h+16); uint32_t block_size = rd_u32(h+24); uint32_t min_region = rd_u32(h+28); (void)min_region;
-    uint64_t blocks = original_size ? (original_size + block_size - 1) / block_size : 0;
+    if (version < BASE9_MIN_VERSION || version > BASE9_VERSION) {
+        fprintf(stderr, "Unsupported BASE9 version: %u\n", version);
+        fclose(in);
+        return 1;
+    }
+    uint64_t original_size = rd_u64(h + 16);
+    uint32_t block_size = rd_u32(h + 24);
+    uint32_t min_region = rd_u32(h + 28);
+    if (!block_size || !min_region || min_region > block_size) {
+        fprintf(stderr, "Invalid BASE9 block or region size.\n");
+        fclose(in);
+        return 1;
+    }
+    uint64_t blocks = original_size / block_size +
+                      (original_size % block_size != 0);
     unsigned threads = auto_threads(block_size, requested_threads, blocks);
-    FILE *out = fopen(dst, "wb"); if (!out) { perror("open output"); fclose(in); return 1; }
-    double start = now_seconds(); uint64_t written = 0, block_index = 0;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { perror("open output"); fclose(in); return 1; }
+
+    double start = now_seconds();
+    uint64_t written = 0, block_index = 0;
+    uint64_t input_remaining = input_size - FILE_HEADER_SIZE;
+    DecodeJob *jobs = NULL;
+    pthread_t *tids = NULL;
+    unsigned batch = 0;
     while (block_index < blocks) {
-        unsigned batch = threads; if (batch > blocks - block_index) batch = (unsigned)(blocks - block_index);
-        DecodeJob *jobs = calloc(batch, sizeof(*jobs)); pthread_t *tids = calloc(batch, sizeof(*tids));
-        if (!jobs || !tids) { fprintf(stderr, "out of memory\n"); free(jobs); free(tids); fclose(in); fclose(out); return 1; }
+        batch = threads;
+        if ((uint64_t)batch > blocks - block_index)
+            batch = (unsigned)(blocks - block_index);
+        jobs = calloc(batch, sizeof(*jobs));
+        tids = calloc(batch, sizeof(*tids));
+        if (!jobs || !tids) {
+            fprintf(stderr, "out of memory\n");
+            goto fail;
+        }
+
         unsigned prepared = 0;
         for (; prepared < batch; ++prepared) {
-            uint8_t bh[BLOCK_HEADER_SIZE]; if (read_exact(in, bh, sizeof(bh)) != 0) break;
-            jobs[prepared].expected_raw_len = rd_u32(bh); jobs[prepared].expected_regions = rd_u32(bh+4); uint64_t body_len = rd_u64(bh+8); jobs[prepared].expected_crc = rd_u32(bh+16);
-            if (body_len > SIZE_MAX) break;
-            jobs[prepared].encoded_len = (size_t)body_len; jobs[prepared].encoded = malloc(body_len ? (size_t)body_len : 1);
-            if (!jobs[prepared].encoded || read_exact(in, jobs[prepared].encoded, (size_t)body_len) != 0) break;
+            uint8_t bh[BLOCK_HEADER_SIZE];
+            if (input_remaining < BLOCK_HEADER_SIZE ||
+                read_exact(in, bh, sizeof(bh)) != 0) {
+                fprintf(stderr, "Truncated block header.\n");
+                goto fail;
+            }
+            input_remaining -= BLOCK_HEADER_SIZE;
+
+            uint64_t source_offset =
+                (block_index + prepared) * (uint64_t)block_size;
+            uint64_t raw_remaining = original_size - source_offset;
+            uint32_t expected_raw_len = raw_remaining > block_size ?
+                                        block_size : (uint32_t)raw_remaining;
+            uint32_t expected_regions = rd_u32(bh + 4);
+            uint64_t body_len = rd_u64(bh + 8);
+            uint64_t max_regions = expected_raw_len / min_region +
+                                   (expected_raw_len % min_region != 0);
+            uint64_t min_body_len =
+                (uint64_t)expected_regions * REGION_HEADER_SIZE;
+            uint64_t max_body_len = expected_raw_len + min_body_len;
+
+            if (rd_u32(bh) != expected_raw_len || expected_regions == 0 ||
+                expected_regions > max_regions || body_len < min_body_len ||
+                body_len > max_body_len || body_len > input_remaining ||
+                body_len > SIZE_MAX || rd_u32(bh + 20) != 0) {
+                fprintf(stderr, "Invalid or truncated block lengths.\n");
+                goto fail;
+            }
+
+            jobs[prepared].expected_raw_len = expected_raw_len;
+            jobs[prepared].expected_regions = expected_regions;
+            jobs[prepared].expected_crc = rd_u32(bh + 16);
+            jobs[prepared].encoded_len = (size_t)body_len;
+            jobs[prepared].encoded = malloc((size_t)body_len);
+            if (!jobs[prepared].encoded ||
+                read_exact(in, jobs[prepared].encoded, (size_t)body_len) != 0) {
+                fprintf(stderr, "Truncated block body or out of memory.\n");
+                goto fail;
+            }
+            input_remaining -= body_len;
         }
-        if (prepared != batch) { fprintf(stderr,"truncated block\n"); for(unsigned i=0;i<prepared;++i) free(jobs[i].encoded); free(jobs);free(tids);fclose(in);fclose(out);return 1; }
-        if (batch == 1) decode_thread(&jobs[0]); else for(unsigned i=0;i<batch;++i) pthread_create(&tids[i],NULL,decode_thread,&jobs[i]);
-        if (batch > 1) for(unsigned i=0;i<batch;++i) pthread_join(tids[i],NULL);
-        for(unsigned i=0;i<batch;++i){
-            if(jobs[i].error || fwrite(jobs[i].decoded.data,1,jobs[i].decoded.len,out)!=jobs[i].decoded.len){fprintf(stderr,"decode/write failed: %s\n",jobs[i].error_msg);for(unsigned j=0;j<batch;++j){free(jobs[j].encoded);bv_free(&jobs[j].decoded);}free(jobs);free(tids);fclose(in);fclose(out);return 1;}
-            written += jobs[i].decoded.len; free(jobs[i].encoded); bv_free(&jobs[i].decoded); ++block_index;
-            printf("\rDecoding: %6.2f%% | blocks=%" PRIu64 "/%" PRIu64, blocks?100.0*(double)block_index/blocks:100.0,block_index,blocks); fflush(stdout);
+
+        if (batch == 1) {
+            decode_thread(&jobs[0]);
+        } else {
+            unsigned started = 0;
+            for (; started < batch; ++started) {
+                if (pthread_create(&tids[started], NULL,
+                                   decode_thread, &jobs[started]) != 0)
+                    break;
+            }
+            /* Fall back to the caller thread if the OS cannot create all workers. */
+            for (unsigned i = started; i < batch; ++i)
+                decode_thread(&jobs[i]);
+            for (unsigned i = 0; i < started; ++i)
+                pthread_join(tids[i], NULL);
         }
-        free(jobs);free(tids);
+
+        for (unsigned i = 0; i < batch; ++i) {
+            if (jobs[i].error ||
+                fwrite(jobs[i].decoded.data, 1, jobs[i].decoded.len, out) !=
+                    jobs[i].decoded.len) {
+                fprintf(stderr, "decode/write failed: %s\n", jobs[i].error_msg);
+                goto fail;
+            }
+            written += jobs[i].decoded.len;
+            ++block_index;
+            printf("\rDecoding: %6.2f%% | blocks=%" PRIu64 "/%" PRIu64,
+                   blocks ? 100.0 * (double)block_index / blocks : 100.0,
+                   block_index, blocks);
+            fflush(stdout);
+        }
+        decode_jobs_free(jobs, batch);
+        free(tids);
+        jobs = NULL;
+        tids = NULL;
+        batch = 0;
     }
-    printf("\n"); fclose(in); fclose(out);
-    if (written != original_size) { fprintf(stderr,"decoded size mismatch\n"); return 1; }
-    double elapsed=now_seconds()-start; printf("BASE9 decode complete\nOutput:      %" PRIu64 " bytes\nThreads:     %u\nElapsed:     %.3f s\nThroughput:  %.2f MiB/s\nCreated:     %s\n",written,threads,elapsed,elapsed>0?(double)written/(1024.0*1024.0)/elapsed:0.0,dst); return 0;
+
+    if (input_remaining != 0) {
+        fprintf(stderr, "Unexpected trailing data after final block.\n");
+        goto fail;
+    }
+    if (written != original_size) {
+        fprintf(stderr, "Decoded size mismatch.\n");
+        goto fail;
+    }
+
+    printf("\n");
+    int close_error = fclose(in) != 0;
+    in = NULL;
+    if (fclose(out) != 0)
+        close_error = 1;
+    out = NULL;
+    if (close_error) {
+        perror("close");
+        return 1;
+    }
+
+    double elapsed = now_seconds() - start;
+    printf("BASE9 decode complete\n"
+           "Output:      %" PRIu64 " bytes\n"
+           "Threads:     %u\n"
+           "Elapsed:     %.3f s\n"
+           "Throughput:  %.2f MiB/s\n"
+           "Created:     %s\n",
+           written, threads, elapsed,
+           elapsed > 0 ? (double)written / (1024.0 * 1024.0) / elapsed : 0.0,
+           dst);
+    return 0;
+
+fail:
+    decode_jobs_free(jobs, batch);
+    free(tids);
+    if (in)
+        fclose(in);
+    if (out)
+        fclose(out);
+    return 1;
 }
 
 static int gpu_bench_generate_input(const char *path, size_t bytes) {
@@ -860,10 +1028,15 @@ static int gpu_bench(void) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage:\n  %s encode INPUT [-o OUTPUT] [--block-mib N] [--min-region-kib N] [--threads N]\n  %s decode INPUT [-o OUTPUT] [--threads N]\n  %s gpu-info\n  %s gpu-bench\n\n"
+        "Usage:\n  %s encode INPUT [-o OUTPUT] [--level fast|balanced|best]\n"
+        "                 [--block-mib N] [--min-region-kib N] [--threads N]\n"
+        "  %s decode INPUT [-o OUTPUT] [--threads N]\n"
+        "  %s gpu-info\n  %s gpu-bench\n\n"
         "BASE9 is a bounded-RAM adaptive compressor. It chooses per region among\n"
         "RAW, adaptive-base packing, token-base, static rANS, delta+rANS, and context rANS,\n"
         "and recursively splits large blocks when local statistics compress better.\n"
+        "The default level is best; fast skips context-rANS and token-base, while\n"
+        "balanced tries context-rANS but skips token-base.\n"
         "GPU token discovery uses OpenCL when available and always has CPU fallback.\n", argv0, argv0, argv0, argv0);
 }
 
@@ -878,21 +1051,61 @@ int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
     bool enc = strcmp(argv[1], "encode") == 0, dec = strcmp(argv[1], "decode") == 0;
     if (!enc && !dec) { usage(argv[0]); return 2; }
-    const char *src = argv[2], *dst_arg = NULL; unsigned block_mib = DEFAULT_BLOCK_MIB, min_kib = DEFAULT_MIN_REGION_KIB, threads = 0;
+    const char *src = argv[2], *dst_arg = NULL;
+    unsigned block_mib = DEFAULT_BLOCK_MIB;
+    unsigned min_kib = DEFAULT_MIN_REGION_KIB;
+    unsigned threads = 0;
+    enum CompressionLevel level = LEVEL_BEST;
     for (int i = 3; i < argc; ++i) {
-        if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) dst_arg = argv[++i];
-        else if (strcmp(argv[i], "--block-mib") == 0 && i + 1 < argc) block_mib = (unsigned)strtoul(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--min-region-kib") == 0 && i + 1 < argc) min_kib = (unsigned)strtoul(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) threads = (unsigned)strtoul(argv[++i], NULL, 10);
-        else { fprintf(stderr, "Unknown/incomplete option: %s\n", argv[i]); usage(argv[0]); return 2; }
+        if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
+            dst_arg = argv[++i];
+        } else if (strcmp(argv[i], "--block-mib") == 0 && i + 1 < argc) {
+            if (parse_unsigned_option(argv[++i], &block_mib) != 0) {
+                fprintf(stderr, "Invalid block size.\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--min-region-kib") == 0 && i + 1 < argc) {
+            if (parse_unsigned_option(argv[++i], &min_kib) != 0) {
+                fprintf(stderr, "Invalid minimum region size.\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            if (parse_unsigned_option(argv[++i], &threads) != 0) {
+                fprintf(stderr, "Invalid thread count.\n");
+                return 2;
+            }
+        } else if (enc && strcmp(argv[i], "--level") == 0 && i + 1 < argc) {
+            const char *value = argv[++i];
+            if (strcmp(value, "fast") == 0)
+                level = LEVEL_FAST;
+            else if (strcmp(value, "balanced") == 0)
+                level = LEVEL_BALANCED;
+            else if (strcmp(value, "best") == 0)
+                level = LEVEL_BEST;
+            else {
+                fprintf(stderr, "Invalid level '%s'; choose fast, balanced, or best.\n", value);
+                return 2;
+            }
+        } else {
+            fprintf(stderr, "Unknown/incomplete option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 2;
+        }
     }
     char *owned = NULL; const char *dst = dst_arg;
     if (!dst) { owned = enc ? default_encoded_path(src) : default_decoded_path(src); dst = owned; }
     if (!dst) { fprintf(stderr,"out of memory\n"); return 1; }
     int rc;
     if (enc) {
-        size_t block = (size_t)block_mib * 1024u * 1024u, minr = (size_t)min_kib * 1024u;
-        rc = encode_file(src, dst, block, minr, threads);
+        size_t block, minr;
+        if (__builtin_mul_overflow((size_t)block_mib,
+                                   (size_t)(1024u * 1024u), &block) ||
+            __builtin_mul_overflow((size_t)min_kib, (size_t)1024u, &minr)) {
+            fprintf(stderr, "Block or minimum region size is too large.\n");
+            free(owned);
+            return 2;
+        }
+        rc = encode_file(src, dst, block, minr, level, threads);
     } else rc = decode_file(src, dst, threads);
     free(owned); return rc;
 }

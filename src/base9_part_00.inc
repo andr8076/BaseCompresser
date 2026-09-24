@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -38,6 +39,34 @@ enum Method {
     METHOD_COUNT = 6,
 };
 
+enum CompressionLevel {
+    LEVEL_FAST = 0,
+    LEVEL_BALANCED = 1,
+    LEVEL_BEST = 2,
+};
+
+static const char *compression_level_name(enum CompressionLevel level) {
+    if (level == LEVEL_FAST) return "fast";
+    if (level == LEVEL_BALANCED) return "balanced";
+    return "best";
+}
+
+static int parse_unsigned_option(const char *text, unsigned *out) {
+    if (!text || !*text || !out)
+        return -1;
+    for (const char *p = text; *p; ++p) {
+        if (*p < '0' || *p > '9')
+            return -1;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (errno || end == text || *end != '\0' || value > UINT_MAX)
+        return -1;
+    *out = (unsigned)value;
+    return 0;
+}
+
 typedef struct {
     uint8_t *data;
     size_t len;
@@ -66,6 +95,7 @@ typedef struct {
     uint8_t *input;
     size_t input_len;
     size_t min_region;
+    enum CompressionLevel level;
     ByteVec encoded;
     uint32_t region_count;
     uint32_t method_counts[METHOD_COUNT];
@@ -86,6 +116,42 @@ typedef struct {
 
 static uint32_t crc_table[256];
 static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
+static long double base9_log2_frequency[RANS_TOTFREQ + 1u];
+static uint64_t base9_div_reciprocal[RANS_TOTFREQ + 1u];
+static pthread_once_t base9_codec_tables_once = PTHREAD_ONCE_INIT;
+
+static void base9_codec_tables_init(void) {
+    for (uint32_t f = 1; f <= RANS_TOTFREQ; ++f) {
+        base9_log2_frequency[f] = log2l((long double)f);
+        if (f > 1)
+            base9_div_reciprocal[f] =
+                (uint64_t)((((__uint128_t)1) << 64) / f);
+    }
+}
+
+/* Exact quotient/remainder for a 32-bit rANS state and frequency <= 4096.
+ * The reciprocal quotient can be low by at most one; the correction keeps
+ * the result bit-identical to `/` and `%` while avoiding integer division in
+ * the per-symbol rANS hot loop.
+ */
+static inline void base9_fast_divmod(
+    uint32_t value, uint32_t divisor, uint32_t *quotient, uint32_t *remainder
+) {
+    if (divisor == 1) {
+        *quotient = value;
+        *remainder = 0;
+        return;
+    }
+    uint32_t q = (uint32_t)(((__uint128_t)value *
+                             base9_div_reciprocal[divisor]) >> 64);
+    uint32_t r = value - q * divisor;
+    if (r >= divisor) {
+        ++q;
+        r -= divisor;
+    }
+    *quotient = q;
+    *remainder = r;
+}
 
 static void crc_init(void) {
     for (uint32_t i = 0; i < 256; ++i) {
@@ -159,6 +225,14 @@ static uint64_t rd_u64(const uint8_t *p) {
     uint64_t x = 0;
     for (int i = 7; i >= 0; --i) x = (x << 8) | p[i];
     return x;
+}
+
+static bool paths_are_same_file(const char *a, const char *b) {
+    if (strcmp(a, b) == 0)
+        return true;
+    struct stat a_stat, b_stat;
+    return stat(a, &a_stat) == 0 && stat(b, &b_stat) == 0 &&
+           a_stat.st_dev == b_stat.st_dev && a_stat.st_ino == b_stat.st_ino;
 }
 
 static void bv_free(ByteVec *v) {

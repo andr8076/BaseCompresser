@@ -20,9 +20,11 @@ The encoder starts with large blocks (64 MiB by default) and uses a dynamic spli
 ```bash
 make
 make test
+make portable
+make test-portable
 ```
 
-The default release build uses `-O3 -march=native -flto` and pthread block parallelism.
+The default build uses `-O3 -march=native -flto` and pthread block parallelism. It targets the CPU used to build it. `make portable` creates `basecompresser-portable` without `-march=native` for distribution to older CPUs of the same operating-system and CPU family; `make test-portable` runs the round-trip and malformed-input suite against that binary.
 
 ## Use
 
@@ -35,9 +37,32 @@ Useful controls:
 
 ```bash
 ./basecompresser encode input.bin --block-mib 64 --min-region-kib 256 --threads 16
+./basecompresser encode input.bin --level fast
 ```
 
 If `--threads` is omitted, BASE9 chooses a worker count from CPU availability and available RAM. Memory scales with block size × active workers, not total file size.
+
+Compression levels control how much time BASE9 spends trying candidate methods. `best` is the default and tries every method. `balanced` includes context-rANS but skips token-base. `fast` skips both context-rANS and token-base while keeping RAW, adaptive-base, rANS, delta-rANS, and adaptive splitting. Faster levels can produce larger files.
+
+## Benchmarking
+
+Run the built-in, deterministic corpus benchmark with:
+
+```bash
+make bench
+python3 bench/benchmark.py --size-mib 16 --repeat 3 --threads 8 --json bench-results.json
+python3 bench/benchmark.py --size-mib 16 --repeat 3 --threads 8 --level fast
+```
+
+The generated cases cover repetitive text, structured records, token-heavy records, a byte counter, random data, mixed data, and already-compressed data. Every run also decodes the output and verifies its SHA-256 against the input. Results include ratio, encode/decode throughput, region-method counts, the source revision, and host details. The default benchmark is CPU-only for repeatability; use `--gpu auto` or `--gpu force` to measure GPU policies.
+
+To benchmark files from a representative local corpus, pass their paths instead of generating examples:
+
+```bash
+python3 bench/benchmark.py --repeat 3 --threads 8 --gpu off /path/to/text.dat /path/to/archive.zip
+```
+
+Benchmark numbers depend on the CPU, storage, block size, thread count, and GPU driver. Compare runs on the same host with the same settings.
 
 ## GPU acceleration
 

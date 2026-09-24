@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/basecompresser"
+BIN="${BASECOMPRESSER_BIN:-$ROOT/basecompresser}"
 
 if ! "$BIN" gpu-info >/dev/null 2>&1; then
     echo "BASE9 GPU equivalence test SKIP (no OpenCL GPU)"

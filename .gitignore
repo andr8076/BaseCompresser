@@ -1,4 +1,6 @@
 basecompresser
+basecompresser-portable
+__pycache__/
 *.base9
 *.decoded
 *.part

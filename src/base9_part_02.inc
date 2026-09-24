@@ -1,7 +1,9 @@
             *--ptr = (uint8_t)state;
             state >>= 8;
         }
-        state = (state / f << RANS_SCALE_BITS) + (state % f) + c;
+        uint32_t quotient, remainder;
+        base9_fast_divmod(state, f, &quotient, &remainder);
+        state = (quotient << RANS_SCALE_BITS) + remainder + c;
     }
     if ((size_t)(ptr - buf) < 4) { free(buf); return -1; }
     ptr -= 4;
@@ -149,7 +151,8 @@ static int context_rans_try_encode(
             if (!row_counts[s]) continue;
             if (!row_freq[s]) goto bad;
             bits += (long double)row_counts[s] *
-                    ((long double)CONTEXT_SCALE_BITS - log2l((long double)row_freq[s]));
+                    ((long double)CONTEXT_SCALE_BITS -
+                     base9_log2_frequency[row_freq[s]]);
         }
     }
 
@@ -182,7 +185,9 @@ static int context_rans_try_encode(
             *--ptr = (uint8_t)state;
             state >>= 8;
         }
-        state = (state / f << CONTEXT_SCALE_BITS) + (state % f) + c;
+        uint32_t quotient, remainder;
+        base9_fast_divmod(state, f, &quotient, &remainder);
+        state = (quotient << CONTEXT_SCALE_BITS) + remainder + c;
     }
 
     if ((size_t)(ptr - buf) < 4) { free(buf); goto bad; }
@@ -297,7 +302,10 @@ fail:
     return -1;
 }
 
-static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Method planned, uint32_t method_counts[METHOD_COUNT]) {
+static int append_region(
+    ByteVec *body, const uint8_t *data, size_t len, enum Method planned,
+    enum CompressionLevel level, uint32_t method_counts[METHOD_COUNT]
+) {
     ByteVec meta = {0}, payload = {0};
     enum Method method = planned;
     int rc = 0;
@@ -314,43 +322,48 @@ static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Me
         best_total = raw_total;
     }
 
-    ByteVec ctx_meta = {0}, ctx_payload = {0};
-    int ctx_rc = context_rans_try_encode(data, len, best_total, &ctx_meta, &ctx_payload);
-    if (ctx_rc < 0) {
-        bv_free(&meta); bv_free(&payload);
-        return -1;
-    }
-    if (ctx_rc == 0) {
-        size_t ctx_total = REGION_HEADER_SIZE + ctx_meta.len + ctx_payload.len;
-        if (ctx_total < best_total) {
+    if (level >= LEVEL_BALANCED) {
+        ByteVec ctx_meta = {0}, ctx_payload = {0};
+        int ctx_rc = context_rans_try_encode(
+            data, len, best_total, &ctx_meta, &ctx_payload);
+        if (ctx_rc < 0) {
             bv_free(&meta); bv_free(&payload);
-            meta = ctx_meta; payload = ctx_payload;
-            ctx_meta = (ByteVec){0}; ctx_payload = (ByteVec){0};
-            method = METHOD_CONTEXT_RANS;
-            best_total = ctx_total;
+            return -1;
         }
+        if (ctx_rc == 0) {
+            size_t ctx_total = REGION_HEADER_SIZE + ctx_meta.len + ctx_payload.len;
+            if (ctx_total < best_total) {
+                bv_free(&meta); bv_free(&payload);
+                meta = ctx_meta; payload = ctx_payload;
+                ctx_meta = (ByteVec){0}; ctx_payload = (ByteVec){0};
+                method = METHOD_CONTEXT_RANS;
+                best_total = ctx_total;
+            }
+        }
+        bv_free(&ctx_meta); bv_free(&ctx_payload);
     }
-    bv_free(&ctx_meta); bv_free(&ctx_payload);
 
-    ByteVec token_meta = {0}, token_payload = {0};
-    int token_rc = token_base_try_encode(
-        data, len, best_total, &token_meta, &token_payload);
-    if (token_rc < 0) {
-        bv_free(&meta); bv_free(&payload);
-        return -1;
-    }
-    if (token_rc == 0) {
-        size_t token_total =
-            REGION_HEADER_SIZE + token_meta.len + token_payload.len;
-        if (token_total < best_total) {
+    if (level >= LEVEL_BEST) {
+        ByteVec token_meta = {0}, token_payload = {0};
+        int token_rc = token_base_try_encode(
+            data, len, best_total, &token_meta, &token_payload);
+        if (token_rc < 0) {
             bv_free(&meta); bv_free(&payload);
-            meta = token_meta; payload = token_payload;
-            token_meta = (ByteVec){0}; token_payload = (ByteVec){0};
-            method = METHOD_TOKEN_BASE;
-            best_total = token_total;
+            return -1;
         }
+        if (token_rc == 0) {
+            size_t token_total =
+                REGION_HEADER_SIZE + token_meta.len + token_payload.len;
+            if (token_total < best_total) {
+                bv_free(&meta); bv_free(&payload);
+                meta = token_meta; payload = token_payload;
+                token_meta = (ByteVec){0}; token_payload = (ByteVec){0};
+                method = METHOD_TOKEN_BASE;
+                best_total = token_total;
+            }
+        }
+        bv_free(&token_meta); bv_free(&token_payload);
     }
-    bv_free(&token_meta); bv_free(&token_payload);
 
     if (method == METHOD_RAW) {
         if (bv_append_u8(body, (uint8_t)METHOD_RAW) != 0 || bv_append_u8(body, 0) != 0 || bv_append_u16(body, 0) != 0 ||
@@ -370,12 +383,17 @@ static int append_region(ByteVec *body, const uint8_t *data, size_t len, enum Me
     return 0;
 }
 
-static int encode_plan_regions(ByteVec *body, const uint8_t *block, const PlanNode *node, uint32_t method_counts[METHOD_COUNT]) {
+static int encode_plan_regions(
+    ByteVec *body, const uint8_t *block, const PlanNode *node,
+    enum CompressionLevel level, uint32_t method_counts[METHOD_COUNT]
+) {
     if (node->left) {
-        if (encode_plan_regions(body, block, node->left, method_counts) != 0) return -1;
-        return encode_plan_regions(body, block, node->right, method_counts);
+        if (encode_plan_regions(body, block, node->left, level, method_counts) != 0)
+            return -1;
+        return encode_plan_regions(body, block, node->right, level, method_counts);
     }
-    return append_region(body, block + node->off, node->len, node->method, method_counts);
+    return append_region(body, block + node->off, node->len, node->method,
+                         level, method_counts);
 }
 
 static int build_leaf_stats(const uint8_t *block, size_t len, size_t min_region, LeafStat **out_leaves, size_t *out_count) {
@@ -407,7 +425,12 @@ static int encode_block(EncodeJob *job) {
     if (!plan) return -1;
     uint32_t regions = (uint32_t)count_plan_regions(plan);
     ByteVec body = {0};
-    if (encode_plan_regions(&body, job->input, plan, job->method_counts) != 0) { free_plan(plan); bv_free(&body); return -1; }
+    if (encode_plan_regions(&body, job->input, plan, job->level,
+                            job->method_counts) != 0) {
+        free_plan(plan);
+        bv_free(&body);
+        return -1;
+    }
     free_plan(plan);
     if (bv_append_u32(&job->encoded, (uint32_t)job->input_len) != 0 || bv_append_u32(&job->encoded, regions) != 0 ||
         bv_append_u64(&job->encoded, (uint64_t)body.len) != 0 || bv_append_u32(&job->encoded, crc32_bytes(job->input, job->input_len)) != 0 ||
@@ -496,8 +519,16 @@ static int decode_block(DecodeJob *job) {
         uint32_t raw_len = rd_u32(p + 4);
         uint32_t payload_len = rd_u32(p + 8);
         uint32_t expected_crc = rd_u32(p + 12);
+        if (p[1] != 0)
+            return -1;
         p += REGION_HEADER_SIZE;
-        if ((size_t)(end - p) < (size_t)meta_len + payload_len) return -1;
+        if (raw_len == 0 || job->decoded.len > job->expected_raw_len ||
+            raw_len > job->expected_raw_len - job->decoded.len)
+            return -1;
+        size_t remaining = (size_t)(end - p);
+        if ((size_t)meta_len > remaining ||
+            (size_t)payload_len > remaining - meta_len)
+            return -1;
         const uint8_t *meta = p; p += meta_len;
         const uint8_t *payload = p; p += payload_len;
         size_t before = job->decoded.len;
@@ -524,4 +555,3 @@ static void *decode_thread(void *arg) {
     }
     return NULL;
 }
-

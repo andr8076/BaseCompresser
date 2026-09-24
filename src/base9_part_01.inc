@@ -7,7 +7,8 @@ static size_t rans_estimate_payload(const uint64_t counts[256], uint64_t total) 
     long double bits = 32.0L;
     for (int i = 0; i < 256; ++i) {
         if (!counts[i]) continue;
-        bits += (long double)counts[i] * ((long double)RANS_SCALE_BITS - log2l((long double)freq[i]));
+        bits += (long double)counts[i] *
+                ((long double)RANS_SCALE_BITS - base9_log2_frequency[freq[i]]);
     }
     return (size_t)ceill(bits / 8.0L);
 }

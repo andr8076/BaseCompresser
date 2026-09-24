@@ -13,3 +13,14 @@ jobs:
         run: make
       - name: Round-trip tests
         run: make test
+      - name: GPU equivalence tests
+        run: make test-gpu
+      - name: Generic CPU build tests
+        run: make test-portable
+      - name: Benchmark smoke test
+        run: python3 bench/benchmark.py --size-mib 1 --repeat 1 --threads 1
+      - name: Address and undefined behavior sanitizers
+        run: |
+          make clean
+          make CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -std=c11 -Wall -Wextra -Wpedantic" LDFLAGS="-fsanitize=address,undefined"
+          ASAN_OPTIONS=detect_leaks=0 make test
